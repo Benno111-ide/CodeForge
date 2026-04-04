@@ -2,7 +2,7 @@
 #include <filesystem>
 
 SettingsManager::SettingsManager() {
-    settingsFile = std::filesystem::current_path() / "settings.json";
+    settingsFile = (std::filesystem::current_path() / "settings.json").string();
     loadSettings();
 }
 

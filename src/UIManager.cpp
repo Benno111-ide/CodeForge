@@ -911,7 +911,7 @@ void UIManager::renderFileDialog() {
             for (const auto& folder : directoryFolders) {
                 if (ImGui::Selectable(("📁 " + folder).c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)) {
                     if (ImGui::IsMouseDoubleClicked(0)) {
-                        navigateToDirectory(std::filesystem::path(currentDirectory) / folder);
+                        navigateToDirectory((std::filesystem::path(currentDirectory) / folder).string());
                     }
                 }
             }
