@@ -6,6 +6,15 @@
 #include <cstdlib>
 #include <chrono>
 #include <regex>
+#include <filesystem>
+
+#ifdef _WIN32
+#define CODEFORGE_POPEN _popen
+#define CODEFORGE_PCLOSE _pclose
+#else
+#define CODEFORGE_POPEN popen
+#define CODEFORGE_PCLOSE pclose
+#endif
 
 CompilerEngine::CompilerEngine() 
     : compilerPath("g++"), cppStandard("17"), optimizationLevel(0), 
@@ -155,13 +164,18 @@ std::vector<std::string> CompilerEngine::detectCompilers() {
 }
 
 bool CompilerEngine::isCompilerAvailable(const std::string& compiler) {
-    std::string command = compiler + " --version > /dev/null 2>&1";
+    std::string command = compiler + " --version";
+#ifdef _WIN32
+    command += " > NUL 2>&1";
+#else
+    command += " > /dev/null 2>&1";
+#endif
     return system(command.c_str()) == 0;
 }
 
 std::string CompilerEngine::getCompilerVersion(const std::string& compiler) {
     std::string command = compiler + " --version 2>&1";
-    FILE* pipe = popen(command.c_str(), "r");
+    FILE* pipe = CODEFORGE_POPEN(command.c_str(), "r");
     if (!pipe) return "Unknown";
     
     char buffer[256];
@@ -169,7 +183,7 @@ std::string CompilerEngine::getCompilerVersion(const std::string& compiler) {
     if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         result = buffer;
     }
-    pclose(pipe);
+    CODEFORGE_PCLOSE(pipe);
     
     return result;
 }
@@ -181,7 +195,7 @@ CompileResult CompilerEngine::executeCompile(const std::string& command, const s
     
     // Execute command and capture output
     std::string fullCommand = command + " 2>&1";
-    FILE* pipe = popen(fullCommand.c_str(), "r");
+    FILE* pipe = CODEFORGE_POPEN(fullCommand.c_str(), "r");
     if (!pipe) {
         result.status = CompileStatus::Error;
         result.output = "Error: Could not execute compiler";
@@ -194,7 +208,7 @@ CompileResult CompilerEngine::executeCompile(const std::string& command, const s
         output += buffer;
     }
     
-    int exitCode = pclose(pipe);
+    int exitCode = CODEFORGE_PCLOSE(pipe);
     result.output = output;
     
     // Parse compiler output for messages
@@ -247,11 +261,12 @@ std::vector<CompileMessage> CompilerEngine::parseCompilerOutput(const std::strin
 }
 
 std::string CompilerEngine::createTemporaryFile(const std::string& content, const std::string& extension) {
-    std::string filename = "/tmp/temp_source" + extension;
+    std::filesystem::path filename = std::filesystem::temp_directory_path() /
+        ("codeforge_temp_source" + extension);
     std::ofstream file(filename);
     if (file.is_open()) {
         file << content;
         file.close();
     }
-    return filename;
+    return filename.string();
 }
