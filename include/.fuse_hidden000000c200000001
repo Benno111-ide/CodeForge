@@ -1,0 +1,176 @@
+#pragma once
+#include <string>
+#include <vector>
+#include <memory>
+
+// Forward declarations
+struct ImDrawList;
+struct ImVec2;
+
+// Text editor functionality
+class CodeEditor {
+public:
+    CodeEditor();
+    ~CodeEditor();
+    
+    // Content management
+    void setText(const std::string& text);
+    std::string getText() const;
+    void clear();
+    
+    // File operations
+    bool loadFile(const std::string& filepath);
+    bool saveFile(const std::string& filepath);
+    bool hasUnsavedChanges() const { return modified; }
+    
+    // Editing operations
+    void insertText(const std::string& text);
+    void deleteSelection();
+    void undo();
+    void redo();
+    
+    // Selection and navigation
+    void selectAll();
+    void copy();
+    void cut();
+    void paste();
+    std::string getSelectedText() const;
+    void find(const std::string& text);
+    void replace(const std::string& find, const std::string& replace);
+    
+    // Cursor and selection
+    struct Position {
+        int line;
+        int column;
+        Position(int l = 0, int c = 0) : line(l), column(c) {}
+    };
+    
+    Position getCursorPosition() const { return cursorPos; }
+    void setCursorPosition(const Position& pos);
+    void moveCursor(int deltaLine, int deltaColumn);
+    
+    // Display
+    void render(const char* title, bool* open = nullptr);
+    void setReadOnly(bool readOnly) { readOnlyMode = readOnly; }
+    bool isReadOnly() const { return readOnlyMode; }
+    
+    // Syntax highlighting
+    void enableSyntaxHighlighting(bool enable) { syntaxHighlighting = enable; }
+    bool isSyntaxHighlightingEnabled() const { return syntaxHighlighting; }
+    
+    // Line numbers
+    void showLineNumbers(bool show) { lineNumbers = show; }
+    bool areLineNumbersVisible() const { return lineNumbers; }
+    
+    // Auto-completion
+    void enableAutoCompletion(bool enable) { autoCompletion = enable; }
+    bool isAutoCompletionEnabled() const { return autoCompletion; }
+    
+    // Errors and warnings
+    struct ErrorMarker {
+        int line;
+        std::string message;
+        bool isError;
+        ErrorMarker(int l, const std::string& msg, bool err = true) 
+            : line(l), message(msg), isError(err) {}
+    };
+    
+    void setErrorMarkers(const std::vector<ErrorMarker>& markers);
+    void clearErrorMarkers();
+    
+    // Settings
+    void setTabSize(int size) { tabSize = size; }
+    void setFont(const std::string& fontName, float fontSize);
+    
+private:
+    std::string content;
+    std::vector<std::string> lines;
+    Position cursorPos;
+    bool modified;
+    bool readOnlyMode;
+    bool syntaxHighlighting;
+    bool lineNumbers;
+    bool autoCompletion;
+    int tabSize;
+    
+    // Selection state
+    Position selectionStart;
+    Position selectionEnd;
+    bool hasSelection;
+    bool mousePressed;
+    bool isDragging;
+    Position dragStartPos;
+    
+    // Scrolling state
+    float scrollY;
+    float scrollX;
+    int visibleLineCount;
+    
+    // Line width cache for horizontal scrolling
+    mutable float cachedMaxLineWidth;
+    mutable bool lineCacheDirty;
+    
+    std::vector<ErrorMarker> errorMarkers;
+    
+    // History for undo/redo
+    struct EditAction {
+        enum Type { Insert, Delete, Replace };
+        Type type;
+        Position pos;
+        std::string text;
+        std::string originalText;
+    };
+    
+    std::vector<EditAction> history;
+    int historyIndex;
+    
+    void updateLines();
+    void addToHistory(const EditAction& action);
+    void applyEdit(const EditAction& action, bool forward = true);
+    
+    // Helper methods for text editing
+    void insertCharacterAtCursor(char c);
+    void backspaceAtCursor();
+    void deleteAtCursor();
+    void moveCursorLeft();
+    void moveCursorLeft(bool extend);
+    void moveCursorRight();
+    void moveCursorRight(bool extend);
+    void moveCursorUp();
+    void moveCursorUp(bool extend);
+    void moveCursorDown();
+    void moveCursorDown(bool extend);
+    void moveCursorToLineStart(bool extend);
+    void moveCursorToLineEnd(bool extend);
+    void moveCursorPageUp(bool extend);
+    void moveCursorPageDown(bool extend);
+    void moveCursorWordLeft(bool extend);
+    void moveCursorWordRight(bool extend);
+    void rebuildContent();
+    void updateSelection(const Position& oldPos, bool extend);
+    
+    // Custom editor rendering
+    void renderCustomEditor();
+    void renderLineWithSyntaxHighlighting(ImDrawList* drawList, ImVec2 linePos, const std::string& line, size_t lineIndex);
+    void renderCursor(ImDrawList* drawList, ImVec2 textStartPos, float lineHeight);
+    void renderSelection(ImDrawList* drawList, ImVec2 textStartPos, float lineHeight);
+    void handleCustomEditorInput();
+    void handleMouseInput(ImVec2 textStartPos, float lineHeight, bool overlayHovered);
+    Position screenPosToTextPos(ImVec2 screenPos, ImVec2 textStartPos, float lineHeight);
+    ImVec2 textPosToScreenPos(const Position& pos, ImVec2 textStartPos, float lineHeight);
+    void selectWordAt(const Position& pos);
+    
+    // Scrolling helpers
+    void ensureCursorVisible();
+    void scrollTo(int line);
+    void handleMouseWheel();
+    int getFirstVisibleLine() const;
+    int getLastVisibleLine() const;
+    
+    // Syntax highlighting helpers
+    void applySyntaxHighlighting();
+    bool isKeyword(const std::string& word) const;
+    bool isType(const std::string& word) const;
+    bool isNumber(const std::string& word) const;
+    bool isString(const std::string& word) const;
+};

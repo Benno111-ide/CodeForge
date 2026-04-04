@@ -1,0 +1,1461 @@
+#include "../include/CodeEditor.h"
+#include <imgui.h>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+
+CodeEditor::CodeEditor() 
+    : modified(false), readOnlyMode(false), syntaxHighlighting(true),
+      lineNumbers(true), autoCompletion(false), tabSize(4), 
+      hasSelection(false), mousePressed(false), isDragging(false),
+      scrollY(0.0f), scrollX(0.0f), visibleLineCount(0), 
+      cachedMaxLineWidth(0.0f), lineCacheDirty(true),
+      historyIndex(-1) {
+    selectionStart = Position(0, 0);
+    selectionEnd = Position(0, 0);
+    dragStartPos = Position(0, 0);
+}
+
+CodeEditor::~CodeEditor() = default;
+
+void CodeEditor::setText(const std::string& text) {
+    content = text;
+    updateLines();
+    cursorPos = Position(0, 0);
+    modified = false;
+    history.clear();
+    historyIndex = -1;
+}
+
+std::string CodeEditor::getText() const {
+    return content;
+}
+
+void CodeEditor::clear() {
+    setText("");
+}
+
+bool CodeEditor::loadFile(const std::string& filepath) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) return false;
+    
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    setText(buffer.str());
+    
+    return true;
+}
+
+bool CodeEditor::saveFile(const std::string& filepath) {
+    std::ofstream file(filepath);
+    if (!file.is_open()) return false;
+    
+    file << content;
+    modified = false;
+    return true;
+}
+
+void CodeEditor::updateLines() {
+    lines.clear();
+    
+    // Invalidate line width cache when content changes
+    lineCacheDirty = true;
+    
+    if (content.empty()) {
+        lines.push_back("");
+        return;
+    }
+    
+    std::stringstream ss(content);
+    std::string line;
+    
+    while (std::getline(ss, line)) {
+        lines.push_back(line);
+    }
+    
+    if (content.back() == '\n') {
+        lines.push_back("");
+    }
+    
+    if (lines.empty()) {
+        lines.push_back("");
+    }
+}
+
+void CodeEditor::render(const char* title, bool* open) {
+    ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
+    
+    if (!ImGui::Begin(title, open)) {
+        ImGui::End();
+        return;
+    }
+    
+    // Toolbar
+    if (ImGui::Button("Save")) {
+        // Trigger save
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load")) {
+        // Trigger load
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Line Numbers", &lineNumbers);
+    ImGui::SameLine();
+    ImGui::Checkbox("Syntax Highlighting", &syntaxHighlighting);
+    
+    ImGui::Separator();
+    
+    // Always use custom editor to support line numbers in both modes
+    renderCustomEditor();
+    
+    // Show status bar
+    ImGui::Separator();
+    ImGui::Text("Lines: %zu | Chars: %zu | Modified: %s", 
+                lines.size(), content.length(), 
+                modified ? "Yes" : "No");
+    
+    if (syntaxHighlighting) {
+        ImGui::SameLine();
+        ImGui::Text("| Syntax: ON");
+    }
+    
+    if (readOnlyMode) {
+        ImGui::SameLine();
+        ImGui::Text("| READ-ONLY");
+    }
+    
+    ImGui::End();
+}
+
+void CodeEditor::renderCustomEditor() {
+    ImVec2 windowSize = ImGui::GetContentRegionAvail();
+    windowSize.y -= ImGui::GetTextLineHeightWithSpacing(); // Leave space for status bar
+    
+    float lineHeight = ImGui::GetTextLineHeight();
+    float lineNumberWidth = lineNumbers ? ImGui::CalcTextSize("9999").x + 10.0f : 0.0f;
+    
+    ImGui::BeginChild("##syntaxeditor", windowSize, true, ImGuiWindowFlags_HorizontalScrollbar);
+    
+    // Sync our scroll position with ImGui's scroll position
+    float imguiScrollY = ImGui::GetScrollY();
+    float imguiScrollX = ImGui::GetScrollX();
+    
+    // Only update our scroll if ImGui scroll has changed
+    if (std::abs(imguiScrollY - scrollY) > 1.0f) {
+        scrollY = imguiScrollY;
+    }
+    if (std::abs(imguiScrollX - scrollX) > 1.0f) {
+        scrollX = imguiScrollX;
+    }
+    
+    // Handle mouse wheel scrolling
+    handleMouseWheel();
+    
+    // Update ImGui's scroll position if we've changed ours
+    if (std::abs(ImGui::GetScrollY() - scrollY) > 1.0f) {
+        ImGui::SetScrollY(scrollY);
+    }
+    if (std::abs(ImGui::GetScrollX() - scrollX) > 1.0f) {
+        ImGui::SetScrollX(scrollX);
+    }
+    
+    // Calculate visible lines
+    visibleLineCount = (int)(windowSize.y / lineHeight) + 1; // +1 for partial lines
+    int firstVisibleLine = getFirstVisibleLine();
+    int lastVisibleLine = getLastVisibleLine();
+    
+    // Ensure cursor is visible when navigating
+    ensureCursorVisible();
+    
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
+    ImVec2 originalCursorPos = cursorScreenPos; // Store original position for line numbers
+    
+    // Apply vertical scrolling offset to content area
+    cursorScreenPos.y -= scrollY;
+    
+    // Draw line numbers (fixed positioning)
+    if (lineNumbers) {
+        // Line numbers should use original position, not scrolled position
+        for (int i = firstVisibleLine; i <= lastVisibleLine && i < (int)lines.size(); ++i) {
+            // Calculate line number position relative to visible area
+            float lineY = originalCursorPos.y + (i - firstVisibleLine) * lineHeight;
+            
+            // Only draw if within visible bounds
+            if (lineY >= originalCursorPos.y && lineY < originalCursorPos.y + windowSize.y) {
+                ImVec2 lineNumPos = ImVec2(originalCursorPos.x + 2.0f, lineY);
+                
+                char lineNumStr[32];
+                snprintf(lineNumStr, sizeof(lineNumStr), "%4d", i + 1);
+                
+                ImU32 lineNumColor = ImGui::GetColorU32(ImVec4(0.6f, 0.6f, 0.7f, 1.0f));
+                drawList->AddText(lineNumPos, lineNumColor, lineNumStr);
+            }
+        }
+        
+        // Draw separator line (fixed to visible area)
+        ImVec2 sepStart = ImVec2(originalCursorPos.x + lineNumberWidth - 5.0f, originalCursorPos.y);
+        ImVec2 sepEnd = ImVec2(sepStart.x, originalCursorPos.y + windowSize.y);
+        ImU32 sepColor = ImGui::GetColorU32(ImVec4(0.4f, 0.4f, 0.5f, 1.0f));
+        drawList->AddLine(sepStart, sepEnd, sepColor);
+    }
+    
+    // Set cursor position for text content
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + lineNumberWidth);
+    ImVec2 textStartPos = ImGui::GetCursorScreenPos();
+    // Note: Don't apply scroll offset here - it's applied per line
+    
+    // Draw text content with syntax highlighting (only visible lines)
+    for (int i = firstVisibleLine; i <= lastVisibleLine && i < (int)lines.size(); ++i) {
+        // Calculate correct position accounting for scroll and visible line offset
+        ImVec2 linePos = ImVec2(textStartPos.x - scrollX, textStartPos.y + (i - firstVisibleLine) * lineHeight);
+        
+        // Highlight current line
+        if (i == cursorPos.line) {
+            ImVec2 lineEnd = ImVec2(textStartPos.x + windowSize.x - lineNumberWidth, linePos.y + lineHeight);
+            ImU32 highlightColor = ImGui::GetColorU32(ImVec4(0.2f, 0.2f, 0.3f, 0.5f));
+            drawList->AddRectFilled(linePos, lineEnd, highlightColor);
+        }
+        
+        // Draw error markers
+        for (const auto& marker : errorMarkers) {
+            if (marker.line == i + 1) {
+                ImVec2 lineEnd = ImVec2(textStartPos.x + windowSize.x - lineNumberWidth, linePos.y + lineHeight);
+                ImU32 errorColor = marker.isError ? 
+                    ImGui::GetColorU32(ImVec4(1.0f, 0.0f, 0.0f, 0.3f)) :
+                    ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 0.0f, 0.3f));
+                drawList->AddRectFilled(linePos, lineEnd, errorColor);
+            }
+        }
+        
+        // Draw text (with or without syntax highlighting)
+        if (syntaxHighlighting) {
+            renderLineWithSyntaxHighlighting(drawList, linePos, lines[i], i);
+        } else {
+            // Draw plain text without syntax highlighting
+            ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+            drawList->AddText(linePos, textColor, lines[i].c_str());
+        }
+    }
+    
+    // Set content size for scrolling
+    float totalHeight = lines.size() * lineHeight;
+    
+    // Use cached max line width or calculate if dirty
+    if (lineCacheDirty || cachedMaxLineWidth == 0.0f) {
+        cachedMaxLineWidth = 0.0f;
+        // Only calculate for visible lines + a buffer for performance
+        int firstLine = std::max(0, getFirstVisibleLine() - 10);
+        int lastLine = std::min((int)lines.size(), getLastVisibleLine() + 10);
+        
+        for (int i = firstLine; i < lastLine; ++i) {
+            if (i < (int)lines.size()) {
+                float lineWidth = ImGui::CalcTextSize(lines[i].c_str()).x;
+                cachedMaxLineWidth = std::max(cachedMaxLineWidth, lineWidth);
+            }
+        }
+        cachedMaxLineWidth += 50.0f; // Add some padding
+        lineCacheDirty = false;
+    }
+    
+    // Draw selection
+    renderSelection(drawList, textStartPos, lineHeight);
+    
+    // Draw cursor
+    renderCursor(drawList, textStartPos, lineHeight);
+    
+    // Add invisible button overlay for mouse capture - positioned as overlay
+    ImVec2 currentCursorPos = ImGui::GetCursorPos();
+    ImGui::SetCursorPos(ImVec2(lineNumbers ? lineNumberWidth : 0.0f, 0));
+    bool overlayHovered = ImGui::InvisibleButton("##editor_overlay", ImVec2(ImGui::GetContentRegionAvail().x - (lineNumbers ? lineNumberWidth : 0.0f), 
+                                                      std::max(totalHeight, ImGui::GetContentRegionAvail().y)));
+    
+    // Restore cursor position and set proper scrolling height and width
+    ImGui::SetCursorPos(currentCursorPos);
+    ImGui::SetCursorPosY(totalHeight);
+    
+    // Set the content size for ImGui scrolling
+    ImGui::Dummy(ImVec2(cachedMaxLineWidth, 0.0f)); // This sets the horizontal scroll range
+
+    // Handle mouse input (check both window hover and overlay hover)
+    handleMouseInput(textStartPos, lineHeight, overlayHovered);
+
+    // Handle keyboard input in the custom editor area
+    handleCustomEditorInput();
+    
+    ImGui::EndChild();
+}
+
+void CodeEditor::renderLineWithSyntaxHighlighting(ImDrawList* drawList, ImVec2 linePos, const std::string& line, size_t lineIndex) {
+    (void)lineIndex; // Unused parameter
+    if (line.empty()) return;
+    
+    float xOffset = 0;
+    size_t pos = 0;
+    
+    while (pos < line.length()) {
+        size_t tokenStart = pos;
+        std::string token;
+        ImU32 color = ImGui::GetColorU32(ImGuiCol_Text); // Default text color
+        
+        char c = line[pos];
+        
+        // Handle different token types
+        if (c == '/' && pos + 1 < line.length() && line[pos + 1] == '/') {
+            // Single-line comment - rest of line
+            token = line.substr(pos);
+            color = ImGui::GetColorU32(ImVec4(0.0f, 0.7f, 0.0f, 1.0f)); // Green
+            pos = line.length();
+        } else if (c == '/' && pos + 1 < line.length() && line[pos + 1] == '*') {
+            // Multi-line comment start
+            size_t end = line.find("*/", pos + 2);
+            if (end != std::string::npos) {
+                token = line.substr(pos, end + 2 - pos);
+                pos = end + 2;
+            } else {
+                token = line.substr(pos);
+                pos = line.length();
+            }
+            color = ImGui::GetColorU32(ImVec4(0.0f, 0.7f, 0.0f, 1.0f)); // Green
+        } else if (c == '"') {
+            // String literal
+            pos++;
+            while (pos < line.length() && line[pos] != '"') {
+                if (line[pos] == '\\' && pos + 1 < line.length()) {
+                    pos += 2; // Skip escaped character
+                } else {
+                    pos++;
+                }
+            }
+            if (pos < line.length()) pos++; // Include closing quote
+            token = line.substr(tokenStart, pos - tokenStart);
+            color = ImGui::GetColorU32(ImVec4(1.0f, 0.8f, 0.2f, 1.0f)); // Yellow
+        } else if (c == '\'') {
+            // Character literal
+            pos++;
+            while (pos < line.length() && line[pos] != '\'') {
+                if (line[pos] == '\\' && pos + 1 < line.length()) {
+                    pos += 2; // Skip escaped character
+                } else {
+                    pos++;
+                }
+            }
+            if (pos < line.length()) pos++; // Include closing quote
+            token = line.substr(tokenStart, pos - tokenStart);
+            color = ImGui::GetColorU32(ImVec4(1.0f, 0.8f, 0.2f, 1.0f)); // Yellow
+        } else if (c == '#') {
+            // Preprocessor directive
+            while (pos < line.length() && (std::isalnum(line[pos]) || line[pos] == '_' || line[pos] == '#')) {
+                pos++;
+            }
+            token = line.substr(tokenStart, pos - tokenStart);
+            color = ImGui::GetColorU32(ImVec4(0.8f, 0.3f, 0.8f, 1.0f)); // Purple
+        } else if (std::isalpha(c) || c == '_') {
+            // Identifier or keyword
+            while (pos < line.length() && (std::isalnum(line[pos]) || line[pos] == '_')) {
+                pos++;
+            }
+            token = line.substr(tokenStart, pos - tokenStart);
+            
+            if (isKeyword(token)) {
+                color = ImGui::GetColorU32(ImVec4(0.3f, 0.7f, 1.0f, 1.0f)); // Blue for keywords
+            } else if (isType(token)) {
+                color = ImGui::GetColorU32(ImVec4(0.4f, 0.8f, 0.4f, 1.0f)); // Light green for types
+            }
+        } else if (std::isdigit(c) || (c == '.' && pos + 1 < line.length() && std::isdigit(line[pos + 1]))) {
+            // Number
+            while (pos < line.length() && (std::isdigit(line[pos]) || line[pos] == '.' || 
+                   line[pos] == 'f' || line[pos] == 'F' || line[pos] == 'l' || line[pos] == 'L' ||
+                   line[pos] == 'u' || line[pos] == 'U' || line[pos] == 'x' || line[pos] == 'X' ||
+                   (line[pos] >= 'a' && line[pos] <= 'f') || (line[pos] >= 'A' && line[pos] <= 'F'))) {
+                pos++;
+            }
+            token = line.substr(tokenStart, pos - tokenStart);
+            color = ImGui::GetColorU32(ImVec4(1.0f, 0.6f, 0.0f, 1.0f)); // Orange for numbers
+        } else {
+            // Single character (operators, punctuation, etc.)
+            token = c;
+            pos++;
+            
+            // Special colors for operators
+            if (c == '+' || c == '-' || c == '*' || c == '/' || c == '=' || 
+                c == '<' || c == '>' || c == '!' || c == '&' || c == '|' || 
+                c == '^' || c == '~' || c == '%') {
+                color = ImGui::GetColorU32(ImVec4(0.9f, 0.9f, 0.9f, 1.0f)); // White for operators
+            }
+        }
+        
+        // Draw the token (scroll offset already applied to linePos)
+        ImVec2 tokenPos = ImVec2(linePos.x + xOffset, linePos.y);
+        drawList->AddText(tokenPos, color, token.c_str());
+        
+        xOffset += ImGui::CalcTextSize(token.c_str()).x;
+    }
+}
+
+void CodeEditor::setErrorMarkers(const std::vector<ErrorMarker>& markers) {
+    errorMarkers = markers;
+}
+
+void CodeEditor::clearErrorMarkers() {
+    errorMarkers.clear();
+}
+
+// Stub implementations for the remaining methods
+void CodeEditor::insertText(const std::string& text) { 
+    content += text;
+    modified = true;
+    updateLines();
+}
+
+void CodeEditor::deleteSelection() { 
+    if (!hasSelection || readOnlyMode) return;
+    
+    Position start = selectionStart;
+    Position end = selectionEnd;
+    
+    // Ensure start comes before end
+    if (start.line > end.line || (start.line == end.line && start.column > end.column)) {
+        std::swap(start, end);
+    }
+    
+    if (start.line == end.line) {
+        // Single line selection
+        if (start.line < (int)lines.size()) {
+            lines[start.line].erase(start.column, end.column - start.column);
+        }
+    } else {
+        // Multi-line selection
+        if (start.line < (int)lines.size() && end.line < (int)lines.size()) {
+            // Keep the part before selection on first line
+            std::string firstPart = lines[start.line].substr(0, start.column);
+            // Keep the part after selection on last line  
+            std::string lastPart = lines[end.line].substr(end.column);
+            
+            // Remove all lines in between
+            lines.erase(lines.begin() + start.line, lines.begin() + end.line + 1);
+            
+            // Insert the combined line
+            lines.insert(lines.begin() + start.line, firstPart + lastPart);
+        }
+    }
+    
+    cursorPos = start;
+    hasSelection = false;
+    modified = true;
+    rebuildContent();
+}
+
+std::string CodeEditor::getSelectedText() const {
+    if (!hasSelection) return "";
+    
+    Position start = selectionStart;
+    Position end = selectionEnd;
+    
+    // Ensure start comes before end
+    if (start.line > end.line || (start.line == end.line && start.column > end.column)) {
+        std::swap(start, end);
+    }
+    
+    std::string result;
+    
+    if (start.line == end.line) {
+        // Single line selection
+        if (start.line < (int)lines.size()) {
+            result = lines[start.line].substr(start.column, end.column - start.column);
+        }
+    } else {
+        // Multi-line selection
+        for (int line = start.line; line <= end.line && line < (int)lines.size(); ++line) {
+            int startCol = (line == start.line) ? start.column : 0;
+            int endCol = (line == end.line) ? end.column : (int)lines[line].length();
+            
+            if (line > start.line) {
+                result += "\n";
+            }
+            
+            if (startCol < endCol) {
+                result += lines[line].substr(startCol, endCol - startCol);
+            }
+        }
+    }
+    
+    return result;
+}
+
+void CodeEditor::undo() {
+    if (historyIndex > 0) {
+        historyIndex--;
+        if (historyIndex < (int)history.size()) {
+            applyEdit(history[historyIndex], false);
+        }
+        modified = true;
+    }
+}
+
+void CodeEditor::redo() {
+    if (historyIndex < (int)history.size() - 1) {
+        historyIndex++;
+        applyEdit(history[historyIndex], true);
+        modified = true;
+    }
+}
+
+void CodeEditor::selectAll() {
+    if (!lines.empty()) {
+        selectionStart = Position(0, 0);
+        selectionEnd = Position((int)lines.size() - 1, (int)lines.back().length());
+        hasSelection = true;
+        cursorPos = selectionEnd;
+    }
+}
+
+void CodeEditor::copy() {
+    if (hasSelection) {
+        std::string selectedText = getSelectedText();
+        ImGui::SetClipboardText(selectedText.c_str());
+    }
+}
+
+void CodeEditor::cut() {
+    if (hasSelection && !readOnlyMode) {
+        std::string selectedText = getSelectedText();
+        ImGui::SetClipboardText(selectedText.c_str());
+        deleteSelection();
+    }
+}
+
+void CodeEditor::paste() {
+    if (!readOnlyMode) {
+        const char* clipboardText = ImGui::GetClipboardText();
+        if (clipboardText) {
+            if (hasSelection) {
+                deleteSelection();
+            }
+            insertText(clipboardText);
+        }
+    }
+}
+
+void CodeEditor::find(const std::string& text) {
+    (void)text; // Unused parameter
+}
+
+void CodeEditor::replace(const std::string& find, const std::string& replace) {
+    (void)find; // Unused parameter
+    (void)replace; // Unused parameter
+}
+
+void CodeEditor::setCursorPosition(const Position& pos) { 
+    cursorPos = pos;
+    // Clamp cursor position to valid bounds
+    if (cursorPos.line < 0) cursorPos.line = 0;
+    if (cursorPos.line >= (int)lines.size()) cursorPos.line = (int)lines.size() - 1;
+    if (cursorPos.line >= 0 && cursorPos.line < (int)lines.size()) {
+        if (cursorPos.column < 0) cursorPos.column = 0;
+        if (cursorPos.column > (int)lines[cursorPos.line].length()) {
+            cursorPos.column = (int)lines[cursorPos.line].length();
+        }
+    }
+}
+
+void CodeEditor::moveCursor(int deltaLine, int deltaColumn) {
+    Position newPos = Position(cursorPos.line + deltaLine, cursorPos.column + deltaColumn);
+    setCursorPosition(newPos);
+}
+
+// Helper methods for cursor movement and text editing
+void CodeEditor::insertCharacterAtCursor(char c) {
+    if (lines.empty()) {
+        lines.push_back("");
+    }
+    
+    // Ensure cursor is within valid bounds
+    if (cursorPos.line >= (int)lines.size()) {
+        cursorPos.line = (int)lines.size() - 1;
+    }
+    if (cursorPos.line < 0) {
+        cursorPos.line = 0;
+    }
+    
+    if (cursorPos.line < (int)lines.size()) {
+        if (c == '\n') {
+            // Split line at cursor
+            std::string rightPart = lines[cursorPos.line].substr(cursorPos.column);
+            lines[cursorPos.line] = lines[cursorPos.line].substr(0, cursorPos.column);
+            cursorPos.line++;
+            cursorPos.column = 0;
+            lines.insert(lines.begin() + cursorPos.line, rightPart);
+        } else {
+            lines[cursorPos.line].insert(cursorPos.column, 1, c);
+            cursorPos.column++;
+        }
+        modified = true;
+        rebuildContent();
+    }
+}
+
+void CodeEditor::backspaceAtCursor() {
+    if (lines.empty()) return;
+    
+    if (cursorPos.column > 0) {
+        lines[cursorPos.line].erase(cursorPos.column - 1, 1);
+        cursorPos.column--;
+        modified = true;
+        rebuildContent();
+    } else if (cursorPos.line > 0) {
+        // Join with previous line
+        cursorPos.column = (int)lines[cursorPos.line - 1].length();
+        lines[cursorPos.line - 1] += lines[cursorPos.line];
+        lines.erase(lines.begin() + cursorPos.line);
+        cursorPos.line--;
+        modified = true;
+        rebuildContent();
+    }
+}
+
+void CodeEditor::deleteAtCursor() {
+    if (lines.empty()) return;
+    
+    if (cursorPos.line < (int)lines.size()) {
+        if (cursorPos.column < (int)lines[cursorPos.line].length()) {
+            lines[cursorPos.line].erase(cursorPos.column, 1);
+            modified = true;
+            rebuildContent();
+        } else if (cursorPos.line < (int)lines.size() - 1) {
+            // Join with next line
+            lines[cursorPos.line] += lines[cursorPos.line + 1];
+            lines.erase(lines.begin() + cursorPos.line + 1);
+            modified = true;
+            rebuildContent();
+        }
+    }
+}
+
+void CodeEditor::moveCursorLeft() {
+    moveCursorLeft(false);
+}
+
+void CodeEditor::moveCursorLeft(bool extend) {
+    Position oldPos = cursorPos;
+    
+    if (cursorPos.column > 0) {
+        cursorPos.column--;
+    } else if (cursorPos.line > 0) {
+        cursorPos.line--;
+        if (cursorPos.line < (int)lines.size()) {
+            cursorPos.column = (int)lines[cursorPos.line].length();
+        }
+    }
+    
+    updateSelection(oldPos, extend);
+}
+
+void CodeEditor::moveCursorRight() {
+    moveCursorRight(false);
+}
+
+void CodeEditor::moveCursorRight(bool extend) {
+    Position oldPos = cursorPos;
+    
+    if (!lines.empty() && cursorPos.line < (int)lines.size()) {
+        if (cursorPos.column < (int)lines[cursorPos.line].length()) {
+            cursorPos.column++;
+        } else if (cursorPos.line < (int)lines.size() - 1) {
+            cursorPos.line++;
+            cursorPos.column = 0;
+        }
+    }
+    
+    updateSelection(oldPos, extend);
+}
+
+void CodeEditor::moveCursorUp() {
+    moveCursorUp(false);
+}
+
+void CodeEditor::moveCursorUp(bool extend) {
+    Position oldPos = cursorPos;
+    
+    if (cursorPos.line > 0) {
+        cursorPos.line--;
+        if (cursorPos.line < (int)lines.size()) {
+            if (cursorPos.column > (int)lines[cursorPos.line].length()) {
+                cursorPos.column = (int)lines[cursorPos.line].length();
+            }
+        }
+    }
+    
+    updateSelection(oldPos, extend);
+    ensureCursorVisible();
+}
+
+void CodeEditor::moveCursorDown() {
+    moveCursorDown(false);
+}
+
+void CodeEditor::moveCursorDown(bool extend) {
+    Position oldPos = cursorPos;
+    
+    if (!lines.empty() && cursorPos.line < (int)lines.size() - 1) {
+        cursorPos.line++;
+        if (cursorPos.column > (int)lines[cursorPos.line].length()) {
+            cursorPos.column = (int)lines[cursorPos.line].length();
+        }
+    }
+    
+    updateSelection(oldPos, extend);
+    ensureCursorVisible();
+}
+
+void CodeEditor::rebuildContent() {
+    content.clear();
+    for (size_t i = 0; i < lines.size(); ++i) {
+        content += lines[i];
+        if (i < lines.size() - 1) {
+            content += "\n";
+        }
+    }
+    
+    // Invalidate line width cache when content changes
+    lineCacheDirty = true;
+}
+void CodeEditor::setFont(const std::string& fontName, float fontSize) {
+    (void)fontName; // Unused parameter
+    (void)fontSize; // Unused parameter
+    // Font setting implementation would go here
+}
+
+void CodeEditor::addToHistory(const EditAction& action) {
+    // Remove any history after current index
+    history.erase(history.begin() + historyIndex + 1, history.end());
+    history.push_back(action);
+    historyIndex = (int)history.size() - 1;
+}
+
+void CodeEditor::applyEdit(const EditAction& action, bool forward) {
+    if (forward) {
+        // Apply the action forward (redo)
+        switch (action.type) {
+            case EditAction::Insert:
+                if (action.pos.line < (int)lines.size()) {
+                    lines[action.pos.line].insert(action.pos.column, action.text);
+                    cursorPos = Position(action.pos.line, action.pos.column + action.text.length());
+                }
+                break;
+            case EditAction::Delete:
+                if (action.pos.line < (int)lines.size()) {
+                    std::string& line = lines[action.pos.line];
+                    int start = std::min(action.pos.column, (int)line.length());
+                    int length = action.text.length();
+                    if (start + length <= line.length()) {
+                        line.erase(start, length);
+                    }
+                    cursorPos = action.pos;
+                }
+                break;
+            case EditAction::Replace:
+                if (action.pos.line < (int)lines.size()) {
+                    std::string& line = lines[action.pos.line];
+                    int start = std::min(action.pos.column, (int)line.length());
+                    int oldLength = action.originalText.length();
+                    if (start + oldLength <= line.length()) {
+                        line.erase(start, oldLength);
+                        line.insert(start, action.text);
+                    }
+                    cursorPos = Position(action.pos.line, action.pos.column + action.text.length());
+                }
+                break;
+        }
+    } else {
+        // Apply the action in reverse (undo)
+        switch (action.type) {
+            case EditAction::Insert:
+                // To undo an insert, we delete what was inserted
+                if (action.pos.line < (int)lines.size()) {
+                    std::string& line = lines[action.pos.line];
+                    int start = action.pos.column;
+                    int length = action.text.length();
+                    if (start + length <= line.length()) {
+                        line.erase(start, length);
+                    }
+                    cursorPos = action.pos;
+                }
+                break;
+            case EditAction::Delete:
+                // To undo a delete, we insert the deleted text back
+                if (action.pos.line < (int)lines.size()) {
+                    lines[action.pos.line].insert(action.pos.column, action.text);
+                    cursorPos = Position(action.pos.line, action.pos.column + action.text.length());
+                }
+                break;
+            case EditAction::Replace:
+                // To undo a replace, we replace back with original text
+                if (action.pos.line < (int)lines.size()) {
+                    std::string& line = lines[action.pos.line];
+                    int start = std::min(action.pos.column, (int)line.length());
+                    int newLength = action.text.length();
+                    if (start + newLength <= line.length()) {
+                        line.erase(start, newLength);
+                        line.insert(start, action.originalText);
+                    }
+                    cursorPos = Position(action.pos.line, action.pos.column + action.originalText.length());
+                }
+                break;
+        }
+    }
+}
+
+void CodeEditor::applySyntaxHighlighting() {
+    // Advanced syntax highlighting would go here
+}
+
+bool CodeEditor::isKeyword(const std::string& word) const {
+    static const std::vector<std::string> keywords = {
+        "if", "else", "for", "while", "do", "switch", "case", "default",
+        "break", "continue", "return", "goto", "typedef", "struct", "union",
+        "enum", "class", "public", "private", "protected", "virtual", "static",
+        "const", "volatile", "extern", "auto", "register", "sizeof", "template",
+        "typename", "namespace", "using", "try", "catch", "throw", "new", "delete",
+        "this", "friend", "inline", "operator", "true", "false", "nullptr",
+        "constexpr", "decltype", "noexcept", "override", "final", "explicit"
+    };
+    return std::find(keywords.begin(), keywords.end(), word) != keywords.end();
+}
+
+bool CodeEditor::isType(const std::string& word) const {
+    static const std::vector<std::string> types = {
+        "void", "bool", "char", "wchar_t", "char16_t", "char32_t",
+        "short", "int", "long", "signed", "unsigned",
+        "float", "double", "long double",
+        "size_t", "ptrdiff_t", "nullptr_t",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "std::string", "std::vector", "std::map", "std::set",
+        "std::shared_ptr", "std::unique_ptr", "std::weak_ptr"
+    };
+    return std::find(types.begin(), types.end(), word) != types.end();
+}
+
+bool CodeEditor::isNumber(const std::string& word) const {
+    if (word.empty()) return false;
+    return std::isdigit(word[0]) || (word[0] == '.' && word.length() > 1 && std::isdigit(word[1]));
+}
+
+bool CodeEditor::isString(const std::string& word) const {
+    return word.length() >= 2 && 
+           ((word.front() == '"' && word.back() == '"') ||
+            (word.front() == '\'' && word.back() == '\''));
+}
+
+void CodeEditor::renderCursor(ImDrawList* drawList, ImVec2 textStartPos, float lineHeight) {
+    if (cursorPos.line >= 0 && cursorPos.line < (int)lines.size()) {
+        // Calculate cursor position with scroll offset
+        float cursorX = textStartPos.x - scrollX;
+        if (cursorPos.column > 0 && cursorPos.column <= (int)lines[cursorPos.line].length()) {
+            std::string textUpToCursor = lines[cursorPos.line].substr(0, cursorPos.column);
+            cursorX += ImGui::CalcTextSize(textUpToCursor.c_str()).x;
+        }
+        
+        // Calculate Y position relative to visible lines
+        int firstVisibleLine = getFirstVisibleLine();
+        float cursorY = textStartPos.y + (cursorPos.line - firstVisibleLine) * lineHeight;
+        
+        // Only draw cursor if it's in visible area
+        if (cursorPos.line >= firstVisibleLine && cursorPos.line <= getLastVisibleLine()) {
+            // Draw cursor
+            if (ImGui::IsWindowFocused()) {
+                ImU32 cursorColor = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                drawList->AddLine(
+                    ImVec2(cursorX, cursorY),
+                    ImVec2(cursorX, cursorY + lineHeight),
+                    cursorColor,
+                    2.0f
+                );
+            }
+        }
+    }
+}
+
+void CodeEditor::handleCustomEditorInput() {
+    if (ImGui::IsWindowFocused() && ImGui::IsWindowHovered()) {
+        ImGuiIO& io = ImGui::GetIO();
+        
+        // Handle keyboard shortcuts first
+        if (io.KeyCtrl) {
+            if (ImGui::IsKeyPressed(ImGuiKey_A)) {
+                selectAll();
+                return;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_C)) {
+                copy();
+                return;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_V) && !readOnlyMode) {
+                paste();
+                return;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_X) && !readOnlyMode) {
+                cut();
+                return;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Z) && !readOnlyMode) {
+                undo();
+                return;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Y) && !readOnlyMode) {
+                redo();
+                return;
+            }
+            // Word navigation
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+                moveCursorWordLeft(io.KeyShift);
+                return;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+                moveCursorWordRight(io.KeyShift);
+                return;
+            }
+        }
+        
+        // Handle text input
+        if (io.InputQueueCharacters.Size > 0 && !readOnlyMode) {
+            for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
+                ImWchar c = io.InputQueueCharacters[i];
+                if (c == 0) break;
+                if (c >= 32 && c < 127) { // Printable ASCII
+                    if (hasSelection) {
+                        deleteSelection();
+                    }
+                    insertCharacterAtCursor((char)c);
+                }
+            }
+        }
+        
+        // Handle special keys
+        if (!readOnlyMode && ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+            if (hasSelection) {
+                deleteSelection();
+            }
+            insertCharacterAtCursor('\n');
+        }
+        if (!readOnlyMode && ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+            if (hasSelection) {
+                deleteSelection();
+            } else {
+                backspaceAtCursor();
+            }
+        }
+        if (!readOnlyMode && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+            if (hasSelection) {
+                deleteSelection();
+            } else {
+                deleteAtCursor();
+            }
+        }
+        
+        // Handle navigation keys with shift for selection
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+            moveCursorLeft(io.KeyShift);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+            moveCursorRight(io.KeyShift);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+            moveCursorUp(io.KeyShift);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+            moveCursorDown(io.KeyShift);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Home)) {
+            moveCursorToLineStart(io.KeyShift);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_End)) {
+            moveCursorToLineEnd(io.KeyShift);
+        }
+        
+        // Handle Page Up/Down
+        if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) {
+            moveCursorPageUp(io.KeyShift);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) {
+            moveCursorPageDown(io.KeyShift);
+        }
+        
+        // Escape to clear selection
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            hasSelection = false;
+        }
+    }
+}
+
+void CodeEditor::handleMouseInput(ImVec2 textStartPos, float lineHeight, bool overlayHovered) {
+    // Check if child window is hovered or the editor overlay button is hovered
+    bool editorHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) || overlayHovered;
+    if (!editorHovered) return;
+    
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 mousePos = ImGui::GetMousePos();
+
+    // Check if mouse is in line number area (if line numbers are enabled)
+    bool inLineNumberArea = false;
+    if (lineNumbers) {
+        if (mousePos.x < textStartPos.x) {
+            inLineNumberArea = true;
+        }
+    }
+    
+    // Set appropriate cursor when hovering over text area
+    if (!inLineNumberArea) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+    }
+    
+    // Handle mouse clicks (only if not in line number area)
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !inLineNumberArea) {
+        // Capture mouse to prevent window dragging
+        io.WantCaptureMouse = true;
+        
+        Position clickPos = screenPosToTextPos(mousePos, textStartPos, lineHeight);
+        
+        if (!io.KeyShift) {
+            // Normal click - move cursor and clear selection
+            cursorPos = clickPos;
+            hasSelection = false;
+        } else {
+            // Shift+click - extend selection
+            if (!hasSelection) {
+                selectionStart = cursorPos;
+                hasSelection = true;
+            }
+            selectionEnd = clickPos;
+            cursorPos = clickPos;
+        }
+        
+        mousePressed = true;
+        isDragging = false;
+        dragStartPos = clickPos;
+    }
+    
+    // Handle mouse dragging for selection (only if not in line number area)
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && mousePressed && !inLineNumberArea) {
+        // Capture mouse during dragging to prevent window movement
+        io.WantCaptureMouse = true;
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+        
+        Position dragPos = screenPosToTextPos(mousePos, textStartPos, lineHeight);
+        
+        if (!isDragging) {
+            // Start of drag - initialize selection
+            isDragging = true;
+            selectionStart = dragStartPos;
+            hasSelection = true;
+        }
+        
+        // Update selection end and cursor position
+        selectionEnd = dragPos;
+        cursorPos = dragPos;
+        
+        // Ensure proper selection order (start should be before end)
+        if ((selectionEnd.line < selectionStart.line) ||
+            (selectionEnd.line == selectionStart.line && selectionEnd.column < selectionStart.column)) {
+            std::swap(selectionStart, selectionEnd);
+        }
+    }
+    
+    // Handle mouse release
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        mousePressed = false;
+        isDragging = false;
+        
+        // Only clear selection if we actually didn't drag (single click)
+        // Don't clear selection if we have a real selection
+        if (hasSelection && !isDragging && 
+            selectionStart.line == selectionEnd.line && 
+            selectionStart.column == selectionEnd.column) {
+            hasSelection = false;
+        }
+    }
+    
+    // Handle double-click for word selection
+    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        Position clickPos = screenPosToTextPos(mousePos, textStartPos, lineHeight);
+        selectWordAt(clickPos);
+        mousePressed = false;
+        isDragging = false;
+    }
+    
+    // Handle triple-click for line selection
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetTime() - ImGui::GetFrameCount() / ImGui::GetIO().Framerate < 0.5f) {
+        static float lastClickTime = 0.0f;
+        static int clickCount = 0;
+        float currentTime = ImGui::GetTime();
+        
+        if (currentTime - lastClickTime < 0.5f) {
+            clickCount++;
+        } else {
+            clickCount = 1;
+        }
+        
+        if (clickCount == 3) {
+            // Triple-click: select entire line
+            Position clickPos = screenPosToTextPos(mousePos, textStartPos, lineHeight);
+            if (clickPos.line < (int)lines.size()) {
+                selectionStart = Position(clickPos.line, 0);
+                selectionEnd = Position(clickPos.line, (int)lines[clickPos.line].length());
+                hasSelection = true;
+                cursorPos = selectionEnd;
+            }
+            clickCount = 0;
+        }
+        
+        lastClickTime = currentTime;
+    }
+}
+
+CodeEditor::Position CodeEditor::screenPosToTextPos(ImVec2 screenPos, ImVec2 textStartPos, float lineHeight) {
+    Position result(0, 0);
+    
+    // Calculate line number relative to visible lines
+    int firstVisibleLine = getFirstVisibleLine();
+    float relativeY = screenPos.y - textStartPos.y;
+    int visibleLineIndex = (int)(relativeY / lineHeight);
+    result.line = firstVisibleLine + visibleLineIndex;
+    
+    // Clamp to valid line range
+    if (result.line < 0) result.line = 0;
+    if (result.line >= (int)lines.size()) result.line = (int)lines.size() - 1;
+    
+    // Calculate column within the line, accounting for horizontal scroll
+    if (result.line < (int)lines.size()) {
+        float relativeX = (screenPos.x - textStartPos.x) + scrollX; // Add horizontal scroll offset
+        result.column = 0;
+        
+        const std::string& line = lines[result.line];
+        for (size_t i = 0; i < line.length(); ++i) {
+            std::string substr = line.substr(0, i + 1);
+            float textWidth = ImGui::CalcTextSize(substr.c_str()).x;
+            
+            if (relativeX <= textWidth) {
+                result.column = (int)i;
+                break;
+            }
+            result.column = (int)i + 1;
+        }
+        
+        // Clamp to line length
+        if (result.column > (int)line.length()) {
+            result.column = (int)line.length();
+        }
+    }
+    
+    return result;
+}
+
+ImVec2 CodeEditor::textPosToScreenPos(const Position& pos, ImVec2 textStartPos, float lineHeight) {
+    ImVec2 result = textStartPos;
+    
+    // Calculate position relative to visible lines
+    int firstVisibleLine = getFirstVisibleLine();
+    result.y += (pos.line - firstVisibleLine) * lineHeight;
+    
+    // Apply horizontal scroll offset
+    if (pos.line < (int)lines.size() && pos.column > 0) {
+        std::string substr = lines[pos.line].substr(0, pos.column);
+        result.x += ImGui::CalcTextSize(substr.c_str()).x - scrollX;
+    } else {
+        result.x -= scrollX;
+    }
+    
+    return result;
+}
+
+void CodeEditor::renderSelection(ImDrawList* drawList, ImVec2 textStartPos, float lineHeight) {
+    if (!hasSelection) return;
+    
+    Position start = selectionStart;
+    Position end = selectionEnd;
+    
+    // Ensure start comes before end
+    if (start.line > end.line || (start.line == end.line && start.column > end.column)) {
+        std::swap(start, end);
+    }
+    
+    ImU32 selectionColor = ImGui::GetColorU32(ImVec4(0.2f, 0.4f, 0.8f, 0.3f));
+    
+    // Get visible line range for optimization
+    int firstVisibleLine = getFirstVisibleLine();
+    int lastVisibleLine = getLastVisibleLine();
+    
+    for (int line = std::max(start.line, firstVisibleLine); 
+         line <= std::min(end.line, lastVisibleLine) && line < (int)lines.size(); ++line) {
+        
+        int startCol = (line == start.line) ? start.column : 0;
+        int endCol = (line == end.line) ? end.column : (int)lines[line].length();
+        
+        if (startCol >= endCol) continue;
+        
+        // Calculate selection bounds with proper visible line offset
+        float lineY = textStartPos.y + (line - firstVisibleLine) * lineHeight;
+        
+        // Calculate start X position
+        float startX = textStartPos.x - scrollX;
+        if (startCol > 0 && line < (int)lines.size()) {
+            std::string startSubstr = lines[line].substr(0, startCol);
+            startX += ImGui::CalcTextSize(startSubstr.c_str()).x;
+        }
+        
+        // Calculate end X position
+        float endX = textStartPos.x - scrollX;
+        if (endCol > 0 && line < (int)lines.size()) {
+            std::string endSubstr = lines[line].substr(0, endCol);
+            endX += ImGui::CalcTextSize(endSubstr.c_str()).x;
+        }
+        
+        ImVec2 selStart(startX, lineY);
+        ImVec2 selEnd(endX, lineY + lineHeight);
+        
+        // Draw selection rectangle
+        drawList->AddRectFilled(selStart, selEnd, selectionColor);
+    }
+}
+
+void CodeEditor::selectWordAt(const Position& pos) {
+    if (pos.line >= (int)lines.size()) return;
+    
+    const std::string& line = lines[pos.line];
+    if (pos.column >= (int)line.length()) return;
+    
+    // Find word boundaries
+    int start = pos.column;
+    int end = pos.column;
+    
+    // Move start backward to beginning of word
+    while (start > 0 && (std::isalnum(line[start - 1]) || line[start - 1] == '_')) {
+        start--;
+    }
+    
+    // Move end forward to end of word
+    while (end < (int)line.length() && (std::isalnum(line[end]) || line[end] == '_')) {
+        end++;
+    }
+    
+    // Set selection
+    selectionStart = Position(pos.line, start);
+    selectionEnd = Position(pos.line, end);
+    hasSelection = (start != end);
+    cursorPos = selectionEnd;
+}
+
+void CodeEditor::updateSelection(const Position& oldPos, bool extend) {
+    if (extend) {
+        if (!hasSelection) {
+            selectionStart = oldPos;
+            hasSelection = true;
+        }
+        selectionEnd = cursorPos;
+    } else {
+        hasSelection = false;
+    }
+}
+
+void CodeEditor::moveCursorToLineStart(bool extend) {
+    Position oldPos = cursorPos;
+    cursorPos.column = 0;
+    updateSelection(oldPos, extend);
+}
+
+void CodeEditor::moveCursorToLineEnd(bool extend) {
+    Position oldPos = cursorPos;
+    if (cursorPos.line < (int)lines.size()) {
+        cursorPos.column = (int)lines[cursorPos.line].length();
+    }
+    updateSelection(oldPos, extend);
+}
+
+void CodeEditor::moveCursorPageUp(bool extend) {
+    Position oldPos = cursorPos;
+    int linesPerPage = visibleLineCount > 0 ? visibleLineCount : 20; // Use actual visible lines or fallback
+    cursorPos.line -= linesPerPage;
+    if (cursorPos.line < 0) {
+        cursorPos.line = 0;
+    }
+    if (cursorPos.line < (int)lines.size()) {
+        if (cursorPos.column > (int)lines[cursorPos.line].length()) {
+            cursorPos.column = (int)lines[cursorPos.line].length();
+        }
+    }
+    updateSelection(oldPos, extend);
+    ensureCursorVisible();
+}
+
+void CodeEditor::moveCursorPageDown(bool extend) {
+    Position oldPos = cursorPos;
+    int linesPerPage = visibleLineCount > 0 ? visibleLineCount : 20; // Use actual visible lines or fallback
+    cursorPos.line += linesPerPage;
+    if (cursorPos.line >= (int)lines.size()) {
+        cursorPos.line = (int)lines.size() - 1;
+    }
+    if (cursorPos.line >= 0 && cursorPos.line < (int)lines.size()) {
+        if (cursorPos.column > (int)lines[cursorPos.line].length()) {
+            cursorPos.column = (int)lines[cursorPos.line].length();
+        }
+    }
+    updateSelection(oldPos, extend);
+    ensureCursorVisible();
+}
+
+void CodeEditor::moveCursorWordLeft(bool extend) {
+    Position oldPos = cursorPos;
+    
+    if (cursorPos.line < (int)lines.size()) {
+        const std::string& line = lines[cursorPos.line];
+        
+        // Move to beginning of current word or previous word
+        if (cursorPos.column > 0) {
+            cursorPos.column--;
+            
+            // Skip whitespace
+            while (cursorPos.column > 0 && std::isspace(line[cursorPos.column])) {
+                cursorPos.column--;
+            }
+            
+            // Skip word characters
+            while (cursorPos.column > 0 && !std::isspace(line[cursorPos.column - 1]) &&
+                   (std::isalnum(line[cursorPos.column - 1]) || line[cursorPos.column - 1] == '_')) {
+                cursorPos.column--;
+            }
+        } else if (cursorPos.line > 0) {
+            // Move to end of previous line
+            cursorPos.line--;
+            cursorPos.column = (int)lines[cursorPos.line].length();
+        }
+    }
+    
+    updateSelection(oldPos, extend);
+}
+
+void CodeEditor::moveCursorWordRight(bool extend) {
+    Position oldPos = cursorPos;
+    
+    if (cursorPos.line < (int)lines.size()) {
+        const std::string& line = lines[cursorPos.line];
+        
+        // Move to end of current word or next word
+        if (cursorPos.column < (int)line.length()) {
+            // Skip current word
+            while (cursorPos.column < (int)line.length() && 
+                   (std::isalnum(line[cursorPos.column]) || line[cursorPos.column] == '_')) {
+                cursorPos.column++;
+            }
+            
+            // Skip whitespace
+            while (cursorPos.column < (int)line.length() && std::isspace(line[cursorPos.column])) {
+                cursorPos.column++;
+            }
+        } else if (cursorPos.line < (int)lines.size() - 1) {
+            // Move to beginning of next line
+            cursorPos.line++;
+            cursorPos.column = 0;
+        }
+    }
+    
+    updateSelection(oldPos, extend);
+}
+
+// Scrolling helper methods
+void CodeEditor::ensureCursorVisible() {
+    float lineHeight = ImGui::GetTextLineHeight();
+    if (lineHeight <= 0.0f) return;
+    
+    float windowHeight = ImGui::GetContentRegionAvail().y;
+    int visibleLines = (int)(windowHeight / lineHeight);
+    
+    int firstVisible = getFirstVisibleLine();
+    int lastVisible = getLastVisibleLine();
+    
+    // Check if cursor is above visible area
+    if (cursorPos.line < firstVisible) {
+        scrollY = cursorPos.line * lineHeight;
+    }
+    // Check if cursor is below visible area
+    else if (cursorPos.line > lastVisible) {
+        scrollY = (cursorPos.line - visibleLines + 1) * lineHeight;
+    }
+    
+    // Clamp scroll to valid range
+    float maxScroll = std::max(0.0f, (float)lines.size() * lineHeight - windowHeight);
+    scrollY = std::max(0.0f, std::min(scrollY, maxScroll));
+}
+
+void CodeEditor::scrollTo(int line) {
+    float lineHeight = ImGui::GetTextLineHeight();
+    scrollY = line * lineHeight;
+    
+    // Clamp to valid range
+    float windowHeight = ImGui::GetContentRegionAvail().y;
+    float maxScroll = std::max(0.0f, (float)lines.size() * lineHeight - windowHeight);
+    scrollY = std::max(0.0f, std::min(scrollY, maxScroll));
+}
+
+void CodeEditor::handleMouseWheel() {
+    ImGuiIO& io = ImGui::GetIO();
+    
+    // Handle vertical scrolling
+    if (io.MouseWheel != 0.0f) {
+        float lineHeight = ImGui::GetTextLineHeight();
+        if (lineHeight > 0.0f) {
+            scrollY -= io.MouseWheel * lineHeight * 3.0f; // Scroll 3 lines at a time
+            
+            // Clamp scroll to valid range
+            float windowHeight = ImGui::GetContentRegionAvail().y;
+            float maxScroll = std::max(0.0f, (float)lines.size() * lineHeight - windowHeight);
+            scrollY = std::max(0.0f, std::min(scrollY, maxScroll));
+        }
+    }
+    
+    // Handle horizontal scrolling (Shift + wheel or direct horizontal wheel)
+    if (io.MouseWheelH != 0.0f) {
+        scrollX -= io.MouseWheelH * 20.0f; // Scroll 20 pixels at a time
+        scrollX = std::max(0.0f, scrollX); // Don't scroll left past 0
+        
+        // Optional: Add maximum horizontal scroll based on longest line
+        float maxLineWidth = 0.0f;
+        for (const auto& line : lines) {
+            float lineWidth = ImGui::CalcTextSize(line.c_str()).x;
+            maxLineWidth = std::max(maxLineWidth, lineWidth);
+        }
+        float windowWidth = ImGui::GetContentRegionAvail().x;
+        if (lineNumbers) {
+            windowWidth -= ImGui::CalcTextSize("9999").x + 10.0f;
+        }
+        float maxHorizontalScroll = std::max(0.0f, maxLineWidth - windowWidth + 50.0f); // +50 for margin
+        scrollX = std::min(scrollX, maxHorizontalScroll);
+    }
+}
+
+int CodeEditor::getFirstVisibleLine() const {
+    float lineHeight = ImGui::GetTextLineHeight();
+    if (lineHeight <= 0.0f) return 0; // Prevent division by zero
+    
+    int firstLine = (int)(scrollY / lineHeight);
+    
+    // Clamp to valid range
+    firstLine = std::max(0, firstLine);
+    firstLine = std::min(firstLine, (int)lines.size() - 1);
+    
+    return firstLine;
+}
+
+int CodeEditor::getLastVisibleLine() const {
+    float lineHeight = ImGui::GetTextLineHeight();
+    if (lineHeight <= 0.0f) return 0; // Prevent division by zero
+    
+    float windowHeight = ImGui::GetContentRegionAvail().y;
+    int visibleLines = (int)(windowHeight / lineHeight) + 2; // +2 for partial lines
+    int lastLine = getFirstVisibleLine() + visibleLines;
+    
+    // Clamp to valid range
+    return std::min(lastLine, (int)lines.size() - 1);
+}

@@ -1,0 +1,219 @@
+#pragma once
+
+#include <string>
+#include <vector>
+#include <memory>
+#include "imgui.h"
+
+class CodeEditor {
+public:
+    struct Position {
+        int line;
+        int column;
+        
+        Position() : line(0), column(0) {}
+        Position(int l, int c) : line(l), column(c) {}
+        
+        bool operator==(const Position& other) const {
+            return line == other.line && column == other.column;
+        }
+        
+        bool operator!=(const Position& other) const {
+            return !(*this == other);
+        }
+    };
+
+    struct Selection {
+        Position start;
+        Position end;
+        bool active = false;
+        
+        void clear() { active = false; }
+        void set(Position s, Position e) {
+            start = s;
+            end = e;
+            active = true;
+            normalize();
+        }
+        
+        void normalize() {
+            if (start.line > end.line || (start.line == end.line && start.column > end.column)) {
+                std::swap(start, end);
+            }
+        }
+        
+        Position getStart() const {
+            return (start.line < end.line || (start.line == end.line && start.column <= end.column)) ? start : end;
+        }
+        
+        Position getEnd() const {
+            return (start.line > end.line || (start.line == end.line && start.column > end.column)) ? start : end;
+        }
+    };
+
+    CodeEditor();
+    ~CodeEditor();
+
+    // Core interface
+    void render(const char* title, bool* open = nullptr);
+    void setText(const std::string& text);
+    std::string getText() const;
+    void clear();
+    
+    // File operations
+    bool loadFile(const std::string& filepath);
+    bool saveFile(const std::string& filepath);
+    bool hasUnsavedChanges() const;
+    
+    // Configuration
+    void setSyntaxHighlighting(bool enabled) { syntaxHighlighting = enabled; }
+    void setLineNumbers(bool enabled) { lineNumbers = enabled; }
+    void setReadOnly(bool readOnly) { this->readOnly = readOnly; }
+    void setTabSize(int size) { tabSize = size; }
+    
+    // Error markers
+    struct ErrorMarker {
+        int line;
+        std::string message;
+        bool isError;
+        ErrorMarker(int l, const std::string& msg, bool err = true) 
+            : line(l), message(msg), isError(err) {}
+    };
+    
+    void setErrorMarkers(const std::vector<ErrorMarker>& markers);
+    void clearErrorMarkers();
+    
+    // State queries
+    bool isModified() const { return modified; }
+    Position getCursorPosition() const { return cursor; }
+    bool hasSelection() const { return selection.active; }
+    
+    // Edit operations for UIManager compatibility
+    void undo();
+    void redo();
+    void cut();
+    void copy();
+    void paste();
+    void selectAll();
+    std::string getSelectedText() const;
+    void find(const std::string& text);
+    void replace(const std::string& find, const std::string& replaceText);
+    
+    // Advanced selection methods
+    void selectWordAt(const Position& pos);
+    void selectLineAt(const Position& pos);
+    bool canUndo() const;
+    bool canRedo() const;
+
+    // History for undo/redo
+    struct EditAction {
+        enum Type { Insert, Delete, Replace };
+        Type type;
+        Position pos;
+        std::string text;
+        std::string originalText;
+    };
+
+private:
+    // Core rendering functions
+    void renderEditor();
+    void renderLineNumbers(ImDrawList* drawList, ImVec2 startPos, float lineHeight, int firstLine, int lastLine);
+    void renderText(ImDrawList* drawList, ImVec2 startPos, float lineHeight, int firstLine, int lastLine);
+    void renderCursor(ImDrawList* drawList, ImVec2 startPos, float lineHeight);
+    void renderSelection(ImDrawList* drawList, ImVec2 startPos, float lineHeight);
+    
+    // Input handling
+    void handleKeyboard();
+    void handleMouse(ImVec2 startPos, float lineHeight);
+    
+    // Text operations
+    void insertText(const std::string& text);
+    void deleteSelection();
+    char deleteChar(); // Returns deleted character
+    void insertChar(char c);
+    void insertNewline();
+    
+    // Navigation
+    void moveCursor(int deltaLine, int deltaColumn, bool extendSelection = false);
+    void setCursor(Position pos, bool extendSelection = false);
+    Position screenToTextPos(ImVec2 screenPos, ImVec2 textStart, float lineHeight) const;
+    ImVec2 textToScreenPos(Position pos, ImVec2 textStart, float lineHeight) const;
+    
+    // Advanced navigation
+    void moveCursorWordLeft(bool extend = false);
+    void moveCursorWordRight(bool extend = false);
+    void moveCursorToLineStart(bool extend = false);
+    void moveCursorToLineEnd(bool extend = false);
+    void moveCursorPageUp(bool extend = false);
+    void moveCursorPageDown(bool extend = false);
+    
+    // Syntax highlighting
+    void renderLineWithSyntaxHighlighting(ImDrawList* drawList, ImVec2 linePos, const std::string& line, size_t lineIndex);
+    bool isKeyword(const std::string& word) const;
+    bool isType(const std::string& word) const;
+    bool isNumber(const std::string& word) const;
+    bool isString(const std::string& word) const;
+    
+    // Scrolling
+    void updateScroll();
+    void ensureCursorVisible();
+    int getVisibleLineCount() const;
+    
+    // Utility
+    void splitTextIntoLines();
+    void rebuildText();
+    float getMaxLineWidth() const;
+    
+    // History management
+    void addToHistory(const EditAction& action);
+    void clearRedoHistory();
+    
+    // State
+    std::string text;
+    std::vector<std::string> lines;
+    Position cursor;
+    Selection selection;
+    std::vector<ErrorMarker> errorMarkers;
+
+    // History for undo/redo
+    std::vector<EditAction> history;
+    int historyIndex = -1;
+    
+    // File status
+    bool unsavedChanges = false;
+    std::string filename;
+    
+    // Find/replace state
+    std::string searchText;
+    std::string replaceText;
+    std::vector<Position> searchResults;
+    int currentSearchResult = -1;
+    
+    // Syntax highlighting colors
+    static const ImU32 COLOR_KEYWORD = IM_COL32(86, 156, 214, 255);   // Blue
+    static const ImU32 COLOR_TYPE = IM_COL32(78, 201, 176, 255);      // Cyan
+    static const ImU32 COLOR_STRING = IM_COL32(214, 157, 133, 255);   // Orange
+    static const ImU32 COLOR_NUMBER = IM_COL32(181, 206, 168, 255);   // Light green
+    static const ImU32 COLOR_COMMENT = IM_COL32(106, 153, 85, 255);   // Green
+    static const ImU32 COLOR_DEFAULT = IM_COL32(212, 212, 212, 255);  // Light gray
+    static const ImU32 COLOR_OPERATOR = IM_COL32(192, 192, 192, 255); // White
+    static const ImU32 COLOR_PREPROCESSOR = IM_COL32(155, 155, 155, 255); // Gray
+    
+    // View state
+    float scrollY = 0.0f;
+    float scrollX = 0.0f;
+    
+    // Configuration
+    bool syntaxHighlighting = true;
+    bool lineNumbers = true;
+    bool readOnly = false;
+    bool modified = false;
+    int tabSize = 4;
+    
+    // UI state
+    bool focused = false;
+    float blinkTime = 0.0f;
+    
+    // Cache
+    mutable float maxLineWidth = -1.0f; // -1 means needs recalculation
+};

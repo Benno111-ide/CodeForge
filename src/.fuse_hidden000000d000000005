@@ -1,0 +1,1446 @@
+#include "../include/CodeEditor.h"
+#include <algorithm>
+#include <sstream>
+#include <cmath>
+#include <fstream>
+#include <set>
+#include <cstring>
+#include <cctype>
+
+CodeEditor::CodeEditor() {
+    lines.emplace_back(""); // Start with one empty line
+}
+
+CodeEditor::~CodeEditor() = default;
+
+void CodeEditor::render(const char* title, bool* open) {
+    if (!ImGui::Begin(title, open)) {
+        ImGui::End();
+        return;
+    }
+    
+    focused = ImGui::IsWindowFocused();
+    renderEditor();
+    
+    ImGui::End();
+}
+
+void CodeEditor::renderEditor() {
+    ImVec2 contentRegion = ImGui::GetContentRegionAvail();
+    contentRegion.y -= ImGui::GetTextLineHeightWithSpacing(); // Leave space for status
+    
+    float lineHeight = ImGui::GetTextLineHeight();
+    float lineNumberWidth = lineNumbers ? ImGui::CalcTextSize("9999").x + 20.0f : 0.0f;
+    
+    // Create scrollable child window
+    ImGui::BeginChild("##editor_content", contentRegion, true, 
+                     ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoMove);
+    
+    // Update scroll from ImGui
+    scrollY = ImGui::GetScrollY();
+    scrollX = ImGui::GetScrollX();
+    
+    // Calculate visible lines
+    int firstLine = std::max(0, (int)(scrollY / lineHeight));
+    int lastLine = std::min((int)lines.size() - 1, 
+                           firstLine + getVisibleLineCount() + 1);
+    
+    // Get drawing context
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImVec2 windowPos = ImGui::GetWindowPos();
+    ImVec2 contentRegionMin = ImGui::GetWindowContentRegionMin();
+    ImVec2 contentStart = ImVec2(windowPos.x + contentRegionMin.x, windowPos.y + contentRegionMin.y);
+    ImVec2 textStart = ImVec2(contentStart.x + lineNumberWidth, contentStart.y);
+    
+    // Render components
+    if (lineNumbers) {
+        renderLineNumbers(drawList, contentStart, lineHeight, firstLine, lastLine);
+    }
+    
+    renderSelection(drawList, textStart, lineHeight);
+    renderText(drawList, textStart, lineHeight, firstLine, lastLine);
+    renderCursor(drawList, textStart, lineHeight);
+    
+    // Set content size for proper scrolling
+    float totalHeight = lines.size() * lineHeight;
+    float maxWidth = getMaxLineWidth() + 100.0f; // Add padding
+    ImGui::SetCursorPos(ImVec2(maxWidth, totalHeight));
+    
+    // Handle input
+    handleKeyboard();
+    handleMouse(textStart, lineHeight);
+    
+    // Update scroll if needed
+    updateScroll();
+    
+    ImGui::EndChild();
+    
+    // Status bar
+    ImGui::Text("Line %d, Column %d | %s", 
+               cursor.line + 1, cursor.column + 1, 
+               modified ? "Modified" : "Saved");
+}
+
+void CodeEditor::renderLineNumbers(ImDrawList* drawList, ImVec2 startPos, float lineHeight, int firstLine, int lastLine) {
+    ImU32 lineNumColor = ImGui::GetColorU32(ImVec4(0.6f, 0.6f, 0.7f, 1.0f));
+    ImU32 separatorColor = ImGui::GetColorU32(ImVec4(0.4f, 0.4f, 0.5f, 1.0f));
+    
+    float lineNumberWidth = ImGui::CalcTextSize("9999").x + 20.0f;
+    float yOffset = -scrollY + (firstLine * lineHeight);
+    
+    for (int i = firstLine; i <= lastLine; ++i) {
+        float lineY = startPos.y + yOffset + ((i - firstLine) * lineHeight);
+        
+        char lineNum[16];
+        snprintf(lineNum, sizeof(lineNum), "%4d", i + 1);
+        
+        ImVec2 lineNumPos(startPos.x + 5.0f, lineY);
+        drawList->AddText(lineNumPos, lineNumColor, lineNum);
+    }
+    
+    // Draw separator line
+    float sepX = startPos.x + lineNumberWidth - 10.0f;
+    ImVec2 sepStart(sepX, startPos.y);
+    ImVec2 sepEnd(sepX, startPos.y + ImGui::GetContentRegionAvail().y);
+    drawList->AddLine(sepStart, sepEnd, separatorColor);
+}
+
+void CodeEditor::renderText(ImDrawList* drawList, ImVec2 startPos, float lineHeight, int firstLine, int lastLine) {
+    float yOffset = -scrollY + (firstLine * lineHeight);
+    
+    for (int i = firstLine; i <= lastLine && i < (int)lines.size(); ++i) {
+        float lineY = startPos.y + yOffset + ((i - firstLine) * lineHeight);
+        ImVec2 textPos(startPos.x - scrollX, lineY);
+        
+        if (!lines[i].empty()) {
+            if (syntaxHighlighting) {
+                renderLineWithSyntaxHighlighting(drawList, textPos, lines[i], i);
+            } else {
+                ImU32 textColor = ImGui::GetColorU32(ImGuiCol_Text);
+                drawList->AddText(textPos, textColor, lines[i].c_str());
+            }
+        }
+    }
+}
+
+void CodeEditor::renderCursor(ImDrawList* drawList, ImVec2 startPos, float lineHeight) {
+    if (!focused || cursor.line >= (int)lines.size()) return;
+    
+    // Blink cursor
+    blinkTime += ImGui::GetIO().DeltaTime;
+    bool showCursor = fmod(blinkTime, 1.0f) < 0.5f;
+    if (!showCursor) return;
+    
+    // Calculate cursor position
+    float cursorX = startPos.x - scrollX;
+    if (cursor.column > 0 && cursor.line < (int)lines.size()) {
+        std::string textToCursor = lines[cursor.line].substr(0, 
+                                   std::min(cursor.column, (int)lines[cursor.line].length()));
+        cursorX += ImGui::CalcTextSize(textToCursor.c_str()).x;
+    }
+    
+    float cursorY = startPos.y - scrollY + (cursor.line * lineHeight);
+    
+    // Draw cursor line
+    ImU32 cursorColor = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.8f));
+    ImVec2 cursorStart(cursorX, cursorY);
+    ImVec2 cursorEnd(cursorX, cursorY + lineHeight);
+    drawList->AddLine(cursorStart, cursorEnd, cursorColor, 2.0f);
+}
+
+void CodeEditor::renderSelection(ImDrawList* drawList, ImVec2 startPos, float lineHeight) {
+    if (!selection.active) return;
+    
+    ImU32 selectionColor = ImGui::GetColorU32(ImVec4(0.3f, 0.5f, 0.8f, 0.3f));
+    
+    for (int line = selection.start.line; line <= selection.end.line; ++line) {
+        if (line >= (int)lines.size()) break;
+        
+        int startCol = (line == selection.start.line) ? selection.start.column : 0;
+        int endCol = (line == selection.end.line) ? selection.end.column : (int)lines[line].length();
+        
+        if (startCol >= endCol) continue;
+        
+        float lineY = startPos.y - scrollY + (line * lineHeight);
+        
+        float startX = startPos.x - scrollX;
+        if (startCol > 0) {
+            std::string textToStart = lines[line].substr(0, startCol);
+            startX += ImGui::CalcTextSize(textToStart.c_str()).x;
+        }
+        
+        float endX = startPos.x - scrollX;
+        if (endCol > 0) {
+            std::string textToEnd = lines[line].substr(0, endCol);
+            endX += ImGui::CalcTextSize(textToEnd.c_str()).x;
+        }
+        
+        ImVec2 selStart(startX, lineY);
+        ImVec2 selEnd(endX, lineY + lineHeight);
+        drawList->AddRectFilled(selStart, selEnd, selectionColor);
+    }
+}
+
+void CodeEditor::handleKeyboard() {
+    if (!focused || readOnly) return;
+    
+    ImGuiIO& io = ImGui::GetIO();
+    bool ctrl = io.KeyCtrl;
+    bool shift = io.KeyShift;
+    
+    // Text input
+    if (io.InputQueueCharacters.Size > 0) {
+        for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
+            ImWchar c = io.InputQueueCharacters[i];
+            if (c > 0) {
+                if (c >= 32 || c == '\t') { // Printable characters and tab
+                    insertChar((char)c);
+                }
+            }
+        }
+    }
+    
+    // Navigation
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+        if (ctrl) {
+            // Word left - simplified
+            moveCursor(0, -1, shift);
+        } else {
+            moveCursor(0, -1, shift);
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+        if (ctrl) {
+            // Word right - simplified  
+            moveCursor(0, 1, shift);
+        } else {
+            moveCursor(0, 1, shift);
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+        moveCursor(-1, 0, shift);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+        moveCursor(1, 0, shift);
+    }
+    
+    // Editing
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+        if (selection.active) {
+            deleteSelection();
+        } else {
+            deleteChar();
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        if (selection.active) {
+            deleteSelection();
+        } else {
+            // Delete forward
+            moveCursor(0, 1);
+            deleteChar();
+        }
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+        if (selection.active) {
+            deleteSelection();
+        }
+        insertNewline();
+    }
+    
+    // Selection and editing shortcuts
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+        // Select all
+        selectAll();
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C)) {
+        // Copy
+        copy();
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_X)) {
+        // Cut
+        cut();
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V)) {
+        // Paste
+        paste();
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z)) {
+        // Undo
+        undo();
+    }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y)) {
+        // Redo
+        redo();
+    }
+}
+
+void CodeEditor::handleMouse(ImVec2 startPos, float lineHeight) {
+    ImGuiIO& io = ImGui::GetIO();
+    
+    if (ImGui::IsWindowHovered()) {
+        // Set text cursor when hovering over the text area
+        ImGui::SetMouseCursor(ImGuiMouseCursor_TextInput);
+        
+        // Mouse scrolling disabled
+        // Note: Mouse wheel scrolling and middle mouse panning have been disabled
+        
+        // Left mouse button interactions
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            Position clickPos = screenToTextPos(io.MousePos, startPos, lineHeight);
+            
+            // Handle double-click (select word)
+            static float lastClickTime = 0.0f;
+            static Position lastClickPos = Position(-1, -1);
+            float currentTime = ImGui::GetTime();
+            
+            if (currentTime - lastClickTime < 0.3f && // Within 300ms
+                clickPos.line == lastClickPos.line && 
+                abs(clickPos.column - lastClickPos.column) <= 1) {
+                
+                // Double-click detected - select word
+                selectWordAt(clickPos);
+                
+                // Check for triple-click
+                static float lastDoubleClickTime = 0.0f;
+                if (currentTime - lastDoubleClickTime < 0.3f) {
+                    // Triple-click detected - select line
+                    selectLineAt(clickPos);
+                }
+                lastDoubleClickTime = currentTime;
+            } else {
+                // Single click
+                setCursor(clickPos, io.KeyShift);
+                blinkTime = 0.0f; // Reset cursor blink
+            }
+            
+            lastClickTime = currentTime;
+            lastClickPos = clickPos;
+        }
+        
+        // Mouse dragging for text selection
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) {
+            Position dragPos = screenToTextPos(io.MousePos, startPos, lineHeight);
+            setCursor(dragPos, true); // Always extend selection when dragging
+        }
+        
+        // Right-click context menu
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            Position rightClickPos = screenToTextPos(io.MousePos, startPos, lineHeight);
+            setCursor(rightClickPos, false);
+            ImGui::OpenPopup("EditorContextMenu");
+        }
+        
+        // Context menu
+        if (ImGui::BeginPopup("EditorContextMenu")) {
+            if (ImGui::MenuItem("Cut", "Ctrl+X", false, hasSelection())) {
+                cut();
+            }
+            if (ImGui::MenuItem("Copy", "Ctrl+C", false, hasSelection())) {
+                copy();
+            }
+            const char* clipboardText = ImGui::GetClipboardText();
+            bool hasClipboard = clipboardText != nullptr && strlen(clipboardText) > 0;
+            if (ImGui::MenuItem("Paste", "Ctrl+V", false, hasClipboard)) {
+                paste();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Select All", "Ctrl+A")) {
+                selectAll();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, canUndo())) {
+                undo();
+            }
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, canRedo())) {
+                redo();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Find", "Ctrl+F")) {
+                // TODO: Open find dialog
+            }
+            if (ImGui::MenuItem("Replace", "Ctrl+H")) {
+                // TODO: Open replace dialog
+            }
+            ImGui::EndPopup();
+        }
+    }
+}
+
+void CodeEditor::insertText(const std::string& text) {
+    if (readOnly || text.empty()) return;
+    
+    // Add to history
+    EditAction action;
+    action.type = EditAction::Insert;
+    action.pos = cursor;
+    action.text = text;
+    addToHistory(action);
+    
+    if (selection.active) {
+        deleteSelection();
+    }
+    
+    std::stringstream ss(text);
+    std::string line;
+    bool first = true;
+    
+    while (std::getline(ss, line)) {
+        if (!first) {
+            insertNewline();
+        }
+        
+        for (char c : line) {
+            insertChar(c);
+        }
+        first = false;
+    }
+    
+    unsavedChanges = true;
+}
+
+void CodeEditor::deleteSelection() {
+    if (!selection.active || readOnly) return;
+    
+    // Get the text we're about to delete for history
+    std::string deletedText = getSelectedText();
+    Position startPos = selection.getStart();
+    
+    // Add to history
+    EditAction action;
+    action.type = EditAction::Delete;
+    action.pos = startPos;
+    action.text = deletedText;
+    addToHistory(action);
+    
+    // Simple implementation: delete character by character
+    setCursor(selection.getEnd(), false);
+    
+    while (cursor != selection.getStart()) {
+        deleteChar();
+    }
+    
+    selection.clear();
+    unsavedChanges = true;
+    rebuildText();
+}
+
+char CodeEditor::deleteChar() {
+    if (readOnly || cursor.line >= (int)lines.size()) return 0;
+    
+    if (cursor.column > 0) {
+        // Delete within line
+        char deleted = lines[cursor.line][cursor.column - 1];
+        lines[cursor.line].erase(cursor.column - 1, 1);
+        cursor.column--;
+        unsavedChanges = true;
+        maxLineWidth = -1; // Invalidate cache
+        return deleted;
+    } else if (cursor.line > 0) {
+        // Join with previous line
+        cursor.column = (int)lines[cursor.line - 1].length();
+        lines[cursor.line - 1] += lines[cursor.line];
+        lines.erase(lines.begin() + cursor.line);
+        cursor.line--;
+        unsavedChanges = true;
+        maxLineWidth = -1; // Invalidate cache
+        return '\n';
+    }
+    return 0;
+}
+
+void CodeEditor::insertChar(char c) {
+    if (readOnly) return;
+    
+    if (selection.active) {
+        deleteSelection();
+    }
+    
+    if (cursor.line >= (int)lines.size()) {
+        cursor.line = (int)lines.size() - 1;
+    }
+    
+    if (c == '\t') {
+        // Insert spaces for tab
+        int spaces = tabSize - (cursor.column % tabSize);
+        for (int i = 0; i < spaces; ++i) {
+            lines[cursor.line].insert(cursor.column, 1, ' ');
+            cursor.column++;
+        }
+    } else {
+        lines[cursor.line].insert(cursor.column, 1, c);
+        cursor.column++;
+    }
+    
+    unsavedChanges = true;
+    maxLineWidth = -1; // Invalidate cache
+    ensureCursorVisible();
+}
+
+void CodeEditor::insertNewline() {
+    if (readOnly) return;
+    
+    if (selection.active) {
+        deleteSelection();
+    }
+    
+    if (cursor.line >= (int)lines.size()) {
+        cursor.line = (int)lines.size() - 1;
+    }
+    
+    // Split current line
+    std::string rightPart = lines[cursor.line].substr(cursor.column);
+    lines[cursor.line] = lines[cursor.line].substr(0, cursor.column);
+    
+    cursor.line++;
+    cursor.column = 0;
+    lines.insert(lines.begin() + cursor.line, rightPart);
+    
+    unsavedChanges = true;
+    maxLineWidth = -1; // Invalidate cache
+    ensureCursorVisible();
+}
+
+void CodeEditor::moveCursor(int deltaLine, int deltaColumn, bool extendSelection) {
+    Position newPos = cursor;
+    newPos.line += deltaLine;
+    newPos.column += deltaColumn;
+    setCursor(newPos, extendSelection);
+}
+
+void CodeEditor::setCursor(Position pos, bool extendSelection) {
+    // Clamp to valid range
+    pos.line = std::max(0, std::min(pos.line, (int)lines.size() - 1));
+    if (pos.line < (int)lines.size()) {
+        pos.column = std::max(0, std::min(pos.column, (int)lines[pos.line].length()));
+    }
+    
+    if (extendSelection) {
+        if (!selection.active) {
+            selection.start = cursor;
+        }
+        selection.end = pos;
+        selection.active = true;
+        selection.normalize();
+    } else {
+        selection.clear();
+    }
+    
+    cursor = pos;
+    blinkTime = 0.0f; // Reset blink
+    ensureCursorVisible();
+}
+
+CodeEditor::Position CodeEditor::screenToTextPos(ImVec2 screenPos, ImVec2 textStart, float lineHeight) const {
+    CodeEditor::Position result;
+    
+    // Calculate line
+    float relativeY = screenPos.y - textStart.y + scrollY;
+    result.line = std::max(0, (int)(relativeY / lineHeight));
+    result.line = std::min(result.line, (int)lines.size() - 1);
+    
+    // Calculate column with better precision
+    if (result.line < (int)lines.size()) {
+        float relativeX = screenPos.x - textStart.x + scrollX;
+        result.column = 0;
+        
+        const std::string& line = lines[result.line];
+        if (line.empty()) {
+            result.column = 0;
+        } else {
+            // Find the closest character position
+            float bestDistance = std::abs(relativeX);
+            int bestColumn = 0;
+            
+            for (size_t i = 0; i <= line.length(); ++i) {
+                std::string substr = line.substr(0, i);
+                float charX = ImGui::CalcTextSize(substr.c_str()).x;
+                float distance = std::abs(relativeX - charX);
+                
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestColumn = (int)i;
+                }
+                
+                // If we've passed the click point, also check between characters
+                if (i > 0 && charX > relativeX) {
+                    std::string prevSubstr = line.substr(0, i - 1);
+                    float prevCharX = ImGui::CalcTextSize(prevSubstr.c_str()).x;
+                    float midPoint = (prevCharX + charX) / 2.0f;
+                    
+                    if (relativeX < midPoint) {
+                        bestColumn = (int)(i - 1);
+                    } else {
+                        bestColumn = (int)i;
+                    }
+                    break;
+                }
+            }
+            
+            result.column = std::max(0, std::min(bestColumn, (int)line.length()));
+        }
+    }
+    
+    return result;
+}
+
+ImVec2 CodeEditor::textToScreenPos(Position pos, ImVec2 textStart, float lineHeight) const {
+    ImVec2 result = textStart;
+    result.y += pos.line * lineHeight - scrollY;
+    
+    if (pos.line < (int)lines.size() && pos.column > 0) {
+        std::string substr = lines[pos.line].substr(0, pos.column);
+        result.x += ImGui::CalcTextSize(substr.c_str()).x - scrollX;
+    } else {
+        result.x -= scrollX;
+    }
+    
+    return result;
+}
+
+void CodeEditor::updateScroll() {
+    // Sync with ImGui scroll
+    if (ImGui::GetScrollY() != scrollY) {
+        ImGui::SetScrollY(scrollY);
+    }
+    if (ImGui::GetScrollX() != scrollX) {
+        ImGui::SetScrollX(scrollX);
+    }
+}
+
+void CodeEditor::ensureCursorVisible() {
+    float lineHeight = ImGui::GetTextLineHeight();
+    float visibleHeight = ImGui::GetContentRegionAvail().y;
+    
+    float cursorY = cursor.line * lineHeight;
+    
+    // Adjust vertical scroll
+    if (cursorY < scrollY) {
+        scrollY = cursorY;
+    } else if (cursorY + lineHeight > scrollY + visibleHeight) {
+        scrollY = cursorY + lineHeight - visibleHeight;
+    }
+    
+    // Adjust horizontal scroll
+    if (cursor.line < (int)lines.size() && cursor.column > 0) {
+        std::string textToCursor = lines[cursor.line].substr(0, cursor.column);
+        float cursorX = ImGui::CalcTextSize(textToCursor.c_str()).x;
+        float visibleWidth = ImGui::GetContentRegionAvail().x;
+        
+        if (lineNumbers) {
+            visibleWidth -= ImGui::CalcTextSize("9999").x + 20.0f;
+        }
+        
+        if (cursorX < scrollX) {
+            scrollX = cursorX;
+        } else if (cursorX > scrollX + visibleWidth - 50.0f) { // 50px margin
+            scrollX = cursorX - visibleWidth + 50.0f;
+        }
+    }
+    
+    // Clamp scroll values
+    scrollY = std::max(0.0f, scrollY);
+    scrollX = std::max(0.0f, scrollX);
+}
+
+int CodeEditor::getVisibleLineCount() const {
+    float lineHeight = ImGui::GetTextLineHeight();
+    float visibleHeight = ImGui::GetContentRegionAvail().y;
+    return (int)(visibleHeight / lineHeight) + 1;
+}
+
+void CodeEditor::setText(const std::string& newText) {
+    text = newText;
+    splitTextIntoLines();
+    cursor = Position(0, 0);
+    selection.clear();
+    unsavedChanges = false;
+    maxLineWidth = -1; // Invalidate cache;
+}
+
+std::string CodeEditor::getText() const {
+    return text;
+}
+
+void CodeEditor::clear() {
+    setText("");
+}
+
+void CodeEditor::splitTextIntoLines() {
+    lines.clear();
+    
+    if (text.empty()) {
+        lines.emplace_back("");
+        return;
+    }
+    
+    std::stringstream ss(text);
+    std::string line;
+    
+    while (std::getline(ss, line)) {
+        lines.push_back(line);
+    }
+    
+    if (text.back() == '\n') {
+        lines.emplace_back("");
+    }
+}
+
+void CodeEditor::rebuildText() {
+    text.clear();
+    for (size_t i = 0; i < lines.size(); ++i) {
+        text += lines[i];
+        if (i < lines.size() - 1) {
+            text += '\n';
+        }
+    }
+}
+
+float CodeEditor::getMaxLineWidth() const {
+    if (maxLineWidth < 0.0f) {
+        maxLineWidth = 0.0f;
+        for (const auto& line : lines) {
+            float width = ImGui::CalcTextSize(line.c_str()).x;
+            maxLineWidth = std::max(maxLineWidth, width);
+        }
+    }
+    return maxLineWidth;
+}
+
+void CodeEditor::selectAll() {
+    if (!lines.empty()) {
+        selection.set(Position(0, 0), 
+                     Position((int)lines.size() - 1, (int)lines.back().length()));
+    }
+}
+
+void CodeEditor::selectWordAt(const Position& pos) {
+    if (pos.line >= (int)lines.size()) return;
+    
+    const std::string& line = lines[pos.line];
+    if (pos.column >= (int)line.length()) return;
+    
+    int start = pos.column;
+    int end = pos.column;
+    
+    // Find word boundaries
+    // Move start backwards to beginning of word
+    while (start > 0 && (std::isalnum(line[start - 1]) || line[start - 1] == '_')) {
+        start--;
+    }
+    
+    // Move end forwards to end of word
+    while (end < (int)line.length() && (std::isalnum(line[end]) || line[end] == '_')) {
+        end++;
+    }
+    
+    // Set selection
+    if (start < end) {
+        selection.set(Position(pos.line, start), Position(pos.line, end));
+        cursor = Position(pos.line, end);
+    }
+}
+
+void CodeEditor::selectLineAt(const Position& pos) {
+    if (pos.line >= (int)lines.size()) return;
+    
+    // Select entire line including newline
+    int nextLine = pos.line + 1;
+    int endColumn = 0;
+    
+    if (nextLine < (int)lines.size()) {
+        // Not the last line, select until start of next line
+        endColumn = 0;
+    } else {
+        // Last line, select to end of line
+        nextLine = pos.line;
+        endColumn = (int)lines[pos.line].length();
+    }
+    
+    selection.set(Position(pos.line, 0), Position(nextLine, endColumn));
+    cursor = Position(nextLine, endColumn);
+}
+
+bool CodeEditor::canUndo() const {
+    return historyIndex >= 0;
+}
+
+bool CodeEditor::canRedo() const {
+    return historyIndex + 1 < (int)history.size();
+}
+
+// File operations
+bool CodeEditor::loadFile(const std::string& filepath) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        return false;
+    }
+    
+    std::string content;
+    std::string line;
+    while (std::getline(file, line)) {
+        content += line + "\n";
+    }
+    
+    // Remove last newline if it exists
+    if (!content.empty() && content.back() == '\n') {
+        content.pop_back();
+    }
+    
+    setText(content);
+    filename = filepath;
+    unsavedChanges = false;
+    return true;
+}
+
+bool CodeEditor::saveFile(const std::string& filepath) {
+    std::ofstream file(filepath);
+    if (!file.is_open()) {
+        return false;
+    }
+    
+    file << getText();
+    if (!file.good()) {
+        return false;
+    }
+    
+    filename = filepath;
+    unsavedChanges = false;
+    return true;
+}
+
+bool CodeEditor::hasUnsavedChanges() const {
+    return unsavedChanges;
+}
+
+// History operations
+void CodeEditor::addToHistory(const EditAction& action) {
+    // Remove any redo history
+    if (historyIndex + 1 < (int)history.size()) {
+        history.erase(history.begin() + historyIndex + 1, history.end());
+    }
+    
+    history.push_back(action);
+    historyIndex++;
+    
+    // Limit history size
+    const size_t maxHistory = 1000;
+    if (history.size() > maxHistory) {
+        history.erase(history.begin());
+        historyIndex--;
+    }
+}
+
+void CodeEditor::clearRedoHistory() {
+    if (historyIndex + 1 < (int)history.size()) {
+        history.erase(history.begin() + historyIndex + 1, history.end());
+    }
+}
+
+void CodeEditor::undo() {
+    if (historyIndex < 0) return;
+    
+    const EditAction& action = history[historyIndex];
+    
+    switch (action.type) {
+        case EditAction::Insert:
+            // Undo insert by deleting the inserted text
+            cursor = action.pos;
+            selection.set(action.pos, Position(action.pos.line, 
+                         action.pos.column + (int)action.text.length()));
+            deleteSelection();
+            break;
+            
+        case EditAction::Delete:
+            // Undo delete by reinserting the deleted text
+            cursor = action.pos;
+            insertText(action.text);
+            break;
+            
+        case EditAction::Replace:
+            // Undo replace by restoring original text
+            cursor = action.pos;
+            selection.set(action.pos, Position(action.pos.line, 
+                         action.pos.column + (int)action.text.length()));
+            deleteSelection();
+            insertText(action.originalText);
+            break;
+    }
+    
+    historyIndex--;
+    unsavedChanges = true;
+}
+
+void CodeEditor::redo() {
+    if (historyIndex + 1 >= (int)history.size()) return;
+    
+    historyIndex++;
+    const EditAction& action = history[historyIndex];
+    
+    switch (action.type) {
+        case EditAction::Insert:
+            cursor = action.pos;
+            insertText(action.text);
+            break;
+            
+        case EditAction::Delete:
+            cursor = action.pos;
+            selection.set(action.pos, Position(action.pos.line, 
+                         action.pos.column + (int)action.text.length()));
+            deleteSelection();
+            break;
+            
+        case EditAction::Replace:
+            cursor = action.pos;
+            selection.set(action.pos, Position(action.pos.line, 
+                         action.pos.column + (int)action.originalText.length()));
+            deleteSelection();
+            insertText(action.text);
+            break;
+    }
+    
+    unsavedChanges = true;
+}
+
+// Clipboard operations
+void CodeEditor::cut() {
+    if (!selection.active) return;
+    
+    copy();
+    deleteSelection();
+}
+
+void CodeEditor::copy() {
+    if (!selection.active) return;
+    
+    std::string selectedText = getSelectedText();
+    if (!selectedText.empty()) {
+        ImGui::SetClipboardText(selectedText.c_str());
+    }
+}
+
+void CodeEditor::paste() {
+    const char* clipboardText = ImGui::GetClipboardText();
+    if (clipboardText && strlen(clipboardText) > 0) {
+        if (selection.active) {
+            deleteSelection();
+        }
+        insertText(std::string(clipboardText));
+    }
+}
+
+std::string CodeEditor::getSelectedText() const {
+    if (!selection.active) return "";
+    
+    Position start = selection.getStart();
+    Position end = selection.getEnd();
+    
+    if (start.line == end.line) {
+        // Single line selection
+        const std::string& line = lines[start.line];
+        return line.substr(start.column, end.column - start.column);
+    } else {
+        // Multi-line selection
+        std::string result;
+        
+        // First line
+        const std::string& firstLine = lines[start.line];
+        result += firstLine.substr(start.column) + "\n";
+        
+        // Middle lines
+        for (int i = start.line + 1; i < end.line; i++) {
+            result += lines[i] + "\n";
+        }
+        
+        // Last line
+        const std::string& lastLine = lines[end.line];
+        result += lastLine.substr(0, end.column);
+        
+        return result;
+    }
+}
+
+// Advanced navigation
+void CodeEditor::moveCursorWordLeft(bool extend) {
+    if (cursor.column == 0) {
+        if (cursor.line > 0) {
+            setCursor(Position(cursor.line - 1, (int)lines[cursor.line - 1].length()), extend);
+        }
+        return;
+    }
+    
+    const std::string& line = lines[cursor.line];
+    int pos = cursor.column - 1;
+    
+    // Skip whitespace
+    while (pos >= 0 && std::isspace(line[pos])) {
+        pos--;
+    }
+    
+    // Skip word characters
+    if (pos >= 0 && (std::isalnum(line[pos]) || line[pos] == '_')) {
+        while (pos >= 0 && (std::isalnum(line[pos]) || line[pos] == '_')) {
+            pos--;
+        }
+        pos++;
+    } else {
+        // Skip non-word characters
+        while (pos >= 0 && !std::isalnum(line[pos]) && line[pos] != '_' && !std::isspace(line[pos])) {
+            pos--;
+        }
+        pos++;
+    }
+    
+    setCursor(Position(cursor.line, std::max(0, pos)), extend);
+}
+
+void CodeEditor::moveCursorWordRight(bool extend) {
+    const std::string& line = lines[cursor.line];
+    if (cursor.column >= (int)line.length()) {
+        if (cursor.line < (int)lines.size() - 1) {
+            setCursor(Position(cursor.line + 1, 0), extend);
+        }
+        return;
+    }
+    
+    int pos = cursor.column;
+    
+    // Skip word characters
+    if (std::isalnum(line[pos]) || line[pos] == '_') {
+        while (pos < (int)line.length() && (std::isalnum(line[pos]) || line[pos] == '_')) {
+            pos++;
+        }
+    } else if (!std::isspace(line[pos])) {
+        // Skip non-word characters
+        while (pos < (int)line.length() && !std::isalnum(line[pos]) && line[pos] != '_' && !std::isspace(line[pos])) {
+            pos++;
+        }
+    }
+    
+    // Skip whitespace
+    while (pos < (int)line.length() && std::isspace(line[pos])) {
+        pos++;
+    }
+    
+    setCursor(Position(cursor.line, pos), extend);
+}
+
+void CodeEditor::moveCursorToLineStart(bool extend) {
+    setCursor(Position(cursor.line, 0), extend);
+}
+
+void CodeEditor::moveCursorToLineEnd(bool extend) {
+    setCursor(Position(cursor.line, (int)lines[cursor.line].length()), extend);
+}
+
+void CodeEditor::moveCursorPageUp(bool extend) {
+    int visibleLines = getVisibleLineCount();
+    int newLine = std::max(0, cursor.line - visibleLines);
+    setCursor(Position(newLine, cursor.column), extend);
+}
+
+void CodeEditor::moveCursorPageDown(bool extend) {
+    int visibleLines = getVisibleLineCount();
+    int newLine = std::min((int)lines.size() - 1, cursor.line + visibleLines);
+    setCursor(Position(newLine, cursor.column), extend);
+}
+
+void CodeEditor::renderLineWithSyntaxHighlighting(ImDrawList* drawList, ImVec2 linePos, const std::string& line, size_t lineIndex) {
+    (void)lineIndex;  // Suppress unused parameter warning for now
+    
+    float x = linePos.x;
+    const float y = linePos.y;
+    
+    size_t i = 0;
+    while (i < line.length()) {
+        char c = line[i];
+        
+        // Skip whitespace
+        if (std::isspace(c)) {
+            std::string whitespace(1, c);
+            ImVec2 textSize = ImGui::CalcTextSize(whitespace.c_str());
+            x += textSize.x;
+            i++;
+            continue;
+        }
+        
+        // Handle comments
+        if (i + 1 < line.length() && line[i] == '/' && line[i + 1] == '/') {
+            // Single line comment - color rest of line
+            std::string comment = line.substr(i);
+            drawList->AddText(ImVec2(x, y), COLOR_COMMENT, comment.c_str());
+            break;
+        }
+        
+        if (i + 1 < line.length() && line[i] == '/' && line[i + 1] == '*') {
+            // Multi-line comment start
+            size_t commentEnd = line.find("*/", i + 2);
+            if (commentEnd != std::string::npos) {
+                commentEnd += 2;
+            } else {
+                commentEnd = line.length();
+            }
+            std::string comment = line.substr(i, commentEnd - i);
+            drawList->AddText(ImVec2(x, y), COLOR_COMMENT, comment.c_str());
+            ImVec2 textSize = ImGui::CalcTextSize(comment.c_str());
+            x += textSize.x;
+            i = commentEnd;
+            continue;
+        }
+        
+        // Handle strings
+        if (c == '"') {
+            size_t stringEnd = i + 1;
+            while (stringEnd < line.length() && line[stringEnd] != '"') {
+                if (line[stringEnd] == '\\' && stringEnd + 1 < line.length()) {
+                    stringEnd += 2; // Skip escaped character
+                } else {
+                    stringEnd++;
+                }
+            }
+            if (stringEnd < line.length()) stringEnd++; // Include closing quote
+            
+            std::string stringLit = line.substr(i, stringEnd - i);
+            drawList->AddText(ImVec2(x, y), COLOR_STRING, stringLit.c_str());
+            ImVec2 textSize = ImGui::CalcTextSize(stringLit.c_str());
+            x += textSize.x;
+            i = stringEnd;
+            continue;
+        }
+        
+        // Handle character literals
+        if (c == '\'') {
+            size_t charEnd = i + 1;
+            if (charEnd < line.length() && line[charEnd] == '\\' && charEnd + 1 < line.length()) {
+                charEnd += 2; // Escaped character
+            } else if (charEnd < line.length()) {
+                charEnd++; // Single character
+            }
+            if (charEnd < line.length() && line[charEnd] == '\'') {
+                charEnd++; // Closing quote
+            }
+            
+            std::string charLit = line.substr(i, charEnd - i);
+            drawList->AddText(ImVec2(x, y), COLOR_STRING, charLit.c_str());
+            ImVec2 textSize = ImGui::CalcTextSize(charLit.c_str());
+            x += textSize.x;
+            i = charEnd;
+            continue;
+        }
+        
+        // Handle numbers
+        if (std::isdigit(c) || (c == '.' && i + 1 < line.length() && std::isdigit(line[i + 1]))) {
+            size_t numEnd = i;
+            bool hasDecimal = false;
+            
+            while (numEnd < line.length()) {
+                char nc = line[numEnd];
+                if (std::isdigit(nc)) {
+                    numEnd++;
+                } else if (nc == '.' && !hasDecimal) {
+                    hasDecimal = true;
+                    numEnd++;
+                } else if ((nc == 'f' || nc == 'F' || nc == 'l' || nc == 'L' || nc == 'u' || nc == 'U') && 
+                          numEnd == i && std::isdigit(line[i])) {
+                    numEnd++;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            
+            std::string number = line.substr(i, numEnd - i);
+            drawList->AddText(ImVec2(x, y), COLOR_NUMBER, number.c_str());
+            ImVec2 textSize = ImGui::CalcTextSize(number.c_str());
+            x += textSize.x;
+            i = numEnd;
+            continue;
+        }
+        
+        // Handle preprocessor directives
+        if (c == '#') {
+            size_t directiveEnd = i;
+            while (directiveEnd < line.length() && !std::isspace(line[directiveEnd])) {
+                directiveEnd++;
+            }
+            
+            std::string directive = line.substr(i, directiveEnd - i);
+            if (isKeyword(directive)) {
+                drawList->AddText(ImVec2(x, y), COLOR_PREPROCESSOR, directive.c_str());
+            } else {
+                drawList->AddText(ImVec2(x, y), COLOR_PREPROCESSOR, directive.c_str());
+            }
+            ImVec2 textSize = ImGui::CalcTextSize(directive.c_str());
+            x += textSize.x;
+            i = directiveEnd;
+            continue;
+        }
+        
+        // Handle identifiers (keywords, types, variables)
+        if (std::isalpha(c) || c == '_') {
+            size_t identEnd = i;
+            while (identEnd < line.length() && (std::isalnum(line[identEnd]) || line[identEnd] == '_')) {
+                identEnd++;
+            }
+            
+            std::string identifier = line.substr(i, identEnd - i);
+            ImU32 color = COLOR_DEFAULT;
+            
+            if (isKeyword(identifier)) {
+                color = COLOR_KEYWORD;
+            } else if (isType(identifier)) {
+                color = COLOR_TYPE;
+            }
+            
+            drawList->AddText(ImVec2(x, y), color, identifier.c_str());
+            ImVec2 textSize = ImGui::CalcTextSize(identifier.c_str());
+            x += textSize.x;
+            i = identEnd;
+            continue;
+        }
+        
+        // Handle operators and punctuation
+        std::string punct(1, c);
+        ImU32 color = COLOR_DEFAULT;
+        
+        // Color operators differently
+        if (c == '=' || c == '+' || c == '-' || c == '*' || c == '/' || c == '%' ||
+            c == '<' || c == '>' || c == '!' || c == '&' || c == '|' || c == '^' ||
+            c == '~' || c == '?' || c == ':' || c == ';' || c == ',' ||
+            c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}') {
+            color = COLOR_OPERATOR;
+        }
+        
+        drawList->AddText(ImVec2(x, y), color, punct.c_str());
+        ImVec2 textSize = ImGui::CalcTextSize(punct.c_str());
+        x += textSize.x;
+        i++;
+    }
+}
+
+// Syntax highlighting helpers
+bool CodeEditor::isKeyword(const std::string& word) const {
+    static const std::set<std::string> keywords = {
+        // C keywords
+        "auto", "break", "case", "char", "const", "continue", "default", "do",
+        "double", "else", "enum", "extern", "float", "for", "goto", "if",
+        "inline", "int", "long", "register", "return", "short", "signed",
+        "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned",
+        "void", "volatile", "while", "restrict", "_Alignas", "_Alignof",
+        "_Atomic", "_Static_assert", "_Noreturn", "_Thread_local",
+        
+        // C++ keywords
+        "alignas", "alignof", "and", "and_eq", "asm", "bitand", "bitor",
+        "bool", "catch", "class", "compl", "concept", "const_cast", "consteval",
+        "constexpr", "constinit", "co_await", "co_return", "co_yield",
+        "decltype", "delete", "dynamic_cast", "explicit", "export",
+        "false", "friend", "mutable", "namespace", "new", "noexcept",
+        "not", "not_eq", "nullptr", "operator", "or", "or_eq", "private",
+        "protected", "public", "reinterpret_cast", "requires", "static_assert",
+        "static_cast", "template", "this", "thread_local", "throw", "true",
+        "try", "typeid", "typename", "using", "virtual", "xor", "xor_eq",
+        "override", "final", "import", "module",
+        
+        // Common preprocessor directives
+        "#include", "#define", "#undef", "#ifdef", "#ifndef", "#if", "#endif",
+        "#else", "#elif", "#pragma", "#error", "#warning", "#line"
+    };
+    
+    return keywords.find(word) != keywords.end();
+}
+
+bool CodeEditor::isType(const std::string& word) const {
+    static const std::set<std::string> types = {
+        // Basic C types
+        "int", "char", "float", "double", "bool", "void", "short", "long",
+        "unsigned", "signed", "const", "volatile", "static", "extern", "auto",
+        
+        // Standard integer types
+        "size_t", "ptrdiff_t", "intptr_t", "uintptr_t",
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "int_least8_t", "int_least16_t", "int_least32_t", "int_least64_t",
+        "uint_least8_t", "uint_least16_t", "uint_least32_t", "uint_least64_t",
+        "int_fast8_t", "int_fast16_t", "int_fast32_t", "int_fast64_t",
+        "uint_fast8_t", "uint_fast16_t", "uint_fast32_t", "uint_fast64_t",
+        "intmax_t", "uintmax_t",
+        
+        // Common STL types
+        "string", "wstring", "u16string", "u32string", "string_view",
+        "vector", "array", "deque", "list", "forward_list",
+        "set", "multiset", "map", "multimap", "unordered_set", "unordered_multiset",
+        "unordered_map", "unordered_multimap", "stack", "queue", "priority_queue",
+        "pair", "tuple", "optional", "variant", "any",
+        
+        // Smart pointers and memory management
+        "unique_ptr", "shared_ptr", "weak_ptr", "auto_ptr",
+        
+        // Function and callable types
+        "function", "bind", "mem_fn",
+        
+        // Threading types
+        "thread", "mutex", "condition_variable", "atomic",
+        
+        // Stream types
+        "iostream", "istream", "ostream", "ifstream", "ofstream", "fstream",
+        "stringstream", "istringstream", "ostringstream",
+        
+        // Other common types
+        "exception", "runtime_error", "logic_error", "invalid_argument",
+        "out_of_range", "length_error", "domain_error", "range_error",
+        "overflow_error", "underflow_error"
+    };
+    
+    return types.find(word) != types.end();
+}
+
+bool CodeEditor::isNumber(const std::string& word) const {
+    if (word.empty()) return false;
+    
+    size_t start = 0;
+    if (word[0] == '-' || word[0] == '+') start = 1;
+    if (start >= word.length()) return false;
+    
+    // Check for hexadecimal numbers (0x or 0X)
+    if (start + 2 < word.length() && word[start] == '0' && 
+        (word[start + 1] == 'x' || word[start + 1] == 'X')) {
+        for (size_t i = start + 2; i < word.length(); i++) {
+            char c = std::tolower(word[i]);
+            if (!std::isdigit(c) && (c < 'a' || c > 'f')) {
+                // Check for suffix
+                if (i == word.length() - 1 && (c == 'l' || c == 'u')) continue;
+                if (i == word.length() - 2 && c == 'u' && std::tolower(word[i + 1]) == 'l') {
+                    i++; continue;
+                }
+                if (i == word.length() - 2 && c == 'l' && std::tolower(word[i + 1]) == 'l') {
+                    i++; continue;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    // Check for binary numbers (0b or 0B)
+    if (start + 2 < word.length() && word[start] == '0' && 
+        (word[start + 1] == 'b' || word[start + 1] == 'B')) {
+        for (size_t i = start + 2; i < word.length(); i++) {
+            char c = word[i];
+            if (c != '0' && c != '1') {
+                // Check for suffix
+                if (i == word.length() - 1 && (c == 'l' || c == 'L' || c == 'u' || c == 'U')) continue;
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    // Check for octal numbers (starting with 0)
+    if (word[start] == '0' && word.length() > start + 1) {
+        for (size_t i = start + 1; i < word.length(); i++) {
+            char c = word[i];
+            if (c < '0' || c > '7') {
+                // Check for suffix or decimal point
+                if (c == '.' || c == 'e' || c == 'E') break; // Fall through to decimal check
+                if (i == word.length() - 1 && (c == 'l' || c == 'L' || c == 'u' || c == 'U')) continue;
+                if (i == word.length() - 2) {
+                    char next = word[i + 1];
+                    if ((c == 'u' || c == 'U') && (next == 'l' || next == 'L')) {
+                        i++; continue;
+                    }
+                    if ((c == 'l' || c == 'L') && (next == 'l' || next == 'L')) {
+                        i++; continue;
+                    }
+                }
+                return false;
+            }
+        }
+        // If we got here without hitting decimal/exponent, it's a valid octal
+        if (word.find('.') == std::string::npos && word.find('e') == std::string::npos && word.find('E') == std::string::npos) {
+            return true;
+        }
+    }
+    
+    // Check for decimal numbers
+    bool hasDecimal = false;
+    bool hasExponent = false;
+    
+    for (size_t i = start; i < word.length(); i++) {
+        char c = word[i];
+        
+        if (std::isdigit(c)) continue;
+        
+        if (c == '.' && !hasDecimal && !hasExponent) {
+            hasDecimal = true;
+            continue;
+        }
+        
+        if ((c == 'e' || c == 'E') && !hasExponent && i > start) {
+            hasExponent = true;
+            if (i + 1 < word.length() && (word[i + 1] == '+' || word[i + 1] == '-')) {
+                i++;
+            }
+            continue;
+        }
+        
+        // Check for numeric suffixes
+        if (i == word.length() - 1) {
+            if (c == 'f' || c == 'F' || c == 'l' || c == 'L' || c == 'u' || c == 'U') {
+                continue;
+            }
+        }
+        
+        // Check for compound suffixes like UL, LL, etc.
+        if (i == word.length() - 2) {
+            char next = word[i + 1];
+            if ((c == 'u' || c == 'U') && (next == 'l' || next == 'L')) {
+                i++; continue;
+            }
+            if ((c == 'l' || c == 'L') && (next == 'l' || next == 'L')) {
+                i++; continue;
+            }
+        }
+        
+        return false;
+    }
+    
+    return start < word.length();
+}
+
+bool CodeEditor::isString(const std::string& word) const {
+    return word.length() >= 2 && 
+           ((word[0] == '"' && word.back() == '"') || 
+            (word[0] == '\'' && word.back() == '\''));
+}
+
+// Find and replace
+void CodeEditor::find(const std::string& text) {
+    searchText = text;
+    searchResults.clear();
+    currentSearchResult = -1;
+    
+    if (text.empty()) return;
+    
+    for (int line = 0; line < (int)lines.size(); line++) {
+        size_t pos = 0;
+        while ((pos = lines[line].find(text, pos)) != std::string::npos) {
+            searchResults.emplace_back(line, (int)pos);
+            pos++;
+        }
+    }
+    
+    if (!searchResults.empty()) {
+        currentSearchResult = 0;
+        setCursor(searchResults[0], false);
+        selection.set(searchResults[0], 
+                     Position(searchResults[0].line, 
+                             searchResults[0].column + (int)text.length()));
+    }
+}
+
+void CodeEditor::replace(const std::string& findText, const std::string& replaceText) {
+    if (selection.active && getSelectedText() == findText) {
+        deleteSelection();
+        insertText(replaceText);
+    }
+}
