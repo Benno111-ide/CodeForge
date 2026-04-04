@@ -14,8 +14,26 @@ include(FetchContent)
 
 # Find required packages
 find_package(OpenGL REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_search_module(GLFW REQUIRED glfw3)
+
+# Prefer a system GLFW when available, but fall back to building it from source
+# so CI can produce Windows, Linux, and macOS builds from the same CMake setup.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_search_module(GLFW QUIET glfw3)
+endif()
+
+if(NOT GLFW_FOUND AND NOT TARGET glfw)
+    FetchContent_Declare(
+        glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG 3.4
+    )
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(glfw)
+endif()
 
 # Fetch nlohmann/json for configuration files
 FetchContent_Declare(
@@ -61,10 +79,11 @@ target_include_directories(imgui PUBLIC
     ${IMGUI_DIR}/backends
 )
 
-target_link_libraries(imgui PRIVATE
-    OpenGL::GL
-    ${GLFW_LIBRARIES}
-)
+if(TARGET glfw)
+    target_link_libraries(imgui PRIVATE OpenGL::GL glfw)
+else()
+    target_link_libraries(imgui PRIVATE OpenGL::GL ${GLFW_LIBRARIES})
+endif()
 
 # Add local glad files (commented out due to conflicts with GLFW)
 # add_library(glad STATIC 
@@ -93,16 +112,24 @@ add_executable(CodeForge
 
 target_include_directories(CodeForge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${GLFW_INCLUDE_DIRS}
 )
+
+if(GLFW_INCLUDE_DIRS)
+    target_include_directories(CodeForge PRIVATE ${GLFW_INCLUDE_DIRS})
+endif()
 
 target_link_libraries(CodeForge PRIVATE
     OpenGL::GL
-    ${GLFW_LIBRARIES}
     nlohmann_json::nlohmann_json
     imgui
     glad
 )
+
+if(TARGET glfw)
+    target_link_libraries(CodeForge PRIVATE glfw)
+else()
+    target_link_libraries(CodeForge PRIVATE ${GLFW_LIBRARIES})
+endif()
 
 if (UNIX)
     target_link_libraries(CodeForge PRIVATE dl pthread)
