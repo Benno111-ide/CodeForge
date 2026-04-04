@@ -18,14 +18,18 @@ jobs:
           - os: ubuntu-latest
             label: linux
             executable: CodeForge
+            executable_path: build/bin/CodeForge
             archive: codeforge-linux-build-${{ github.run_number }}.tar.gz
           - os: windows-latest
             label: windows
             executable: CodeForge.exe
+            executable_path: build/bin/Release/CodeForge.exe
             archive: codeforge-windows-build-${{ github.run_number }}.zip
+            generator: Visual Studio 17 2022
           - os: macos-latest
             label: macos
             executable: CodeForge
+            executable_path: build/bin/CodeForge
             archive: codeforge-macos-build-${{ github.run_number }}.tar.gz
 
     runs-on: ${{ matrix.os }}
@@ -39,8 +43,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake g++ pkg-config libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
 
-      - name: Configure
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release
@@ -49,7 +58,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp "build/bin/${{ matrix.executable }}" "dist/${{ matrix.executable }}"
+          cp "${{ matrix.executable_path }}" "dist/${{ matrix.executable }}"
           tar -czf "${{ matrix.archive }}" -C dist "${{ matrix.executable }}"
 
       - name: Package build (Windows)
@@ -57,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "build/bin/${{ matrix.executable }}" "dist/${{ matrix.executable }}"
+          Copy-Item "${{ matrix.executable_path }}" "dist/${{ matrix.executable }}"
           Compress-Archive -Path "dist/${{ matrix.executable }}" -DestinationPath "${{ matrix.archive }}" -Force
 
       - name: Upload packaged build

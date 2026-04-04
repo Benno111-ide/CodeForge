@@ -5,7 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Enable debug symbols and optimizations for debugging
-set(CMAKE_BUILD_TYPE Debug)
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 set(CMAKE_C_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 
@@ -14,6 +16,14 @@ include(FetchContent)
 
 # Find required packages
 find_package(OpenGL REQUIRED)
+
+if(TARGET OpenGL::GL)
+    set(CODEFORGE_OPENGL_TARGET OpenGL::GL)
+elseif(TARGET OpenGL::OpenGL)
+    set(CODEFORGE_OPENGL_TARGET OpenGL::OpenGL)
+else()
+    message(FATAL_ERROR "No suitable OpenGL target was provided by find_package(OpenGL).")
+endif()
 
 # Prefer a system GLFW when available, but fall back to building it from source
 # so CI can produce Windows, Linux, and macOS builds from the same CMake setup.
@@ -80,9 +90,9 @@ target_include_directories(imgui PUBLIC
 )
 
 if(TARGET glfw)
-    target_link_libraries(imgui PRIVATE OpenGL::GL glfw)
+    target_link_libraries(imgui PRIVATE ${CODEFORGE_OPENGL_TARGET} glfw)
 else()
-    target_link_libraries(imgui PRIVATE OpenGL::GL ${GLFW_LIBRARIES})
+    target_link_libraries(imgui PRIVATE ${CODEFORGE_OPENGL_TARGET} ${GLFW_LIBRARIES})
 endif()
 
 # Add local glad files (commented out due to conflicts with GLFW)
@@ -119,7 +129,7 @@ if(GLFW_INCLUDE_DIRS)
 endif()
 
 target_link_libraries(CodeForge PRIVATE
-    OpenGL::GL
+    ${CODEFORGE_OPENGL_TARGET}
     nlohmann_json::nlohmann_json
     imgui
     glad
@@ -131,7 +141,7 @@ else()
     target_link_libraries(CodeForge PRIVATE ${GLFW_LIBRARIES})
 endif()
 
-if (UNIX)
+if(UNIX AND NOT APPLE)
     target_link_libraries(CodeForge PRIVATE dl pthread)
 endif()
 

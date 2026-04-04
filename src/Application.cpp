@@ -17,18 +17,20 @@
 #include <fstream>
 #include <cstring>
 #include <ctime>
-#include <fcntl.h>
+#include <cstdio>
 
-#ifdef __linux__
-#include <execinfo.h>
+#if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
-#include <sys/wait.h>
 #endif
 
 #ifdef __linux__
 #include <execinfo.h>
-#include <unistd.h>
+#include <fcntl.h>
 #include <sys/wait.h>
+#endif
+
+#ifdef _WIN32
+#include <process.h>
 #endif
 
 Application* Application::instance = nullptr;
@@ -36,12 +38,34 @@ Application* Application::instance = nullptr;
 // Global flag to prevent recursive crash handling
 static bool crashHandlerActive = false;
 
+namespace {
+int getCurrentProcessIdValue() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
+}
+
+[[noreturn]] void emergencyExit() {
+    _exit(1);
+}
+
+const char* getImGuiGlslVersion() {
+#ifdef __APPLE__
+    return "#version 150";
+#else
+    return "#version 130";
+#endif
+}
+}
+
 // Crash dump functionality
 void generateCrashDump(const char* signal_name, int sig) {
     // Prevent recursive crash handling
     if (crashHandlerActive) {
         std::cerr << "Recursive crash detected! Exiting immediately." << std::endl;
-        _exit(1);
+        emergencyExit();
     }
     crashHandlerActive = true;
     
@@ -59,7 +83,7 @@ void generateCrashDump(const char* signal_name, int sig) {
         crashFile << "\n=== CODEFORGE CRASH DUMP ===" << std::endl;
         crashFile << "Time: " << timestr << std::endl;
         crashFile << "Signal: " << signal_name << " (" << sig << ")" << std::endl;
-        crashFile << "PID: " << getpid() << std::endl;
+        crashFile << "PID: " << getCurrentProcessIdValue() << std::endl;
         
 #ifdef __linux__
         // Get stack trace with error handling
@@ -114,7 +138,7 @@ void generateCrashDump(const char* signal_name, int sig) {
     if (Application::getInstance()) {
         Application::getInstance()->shutdown();
     }
-    _exit(1);  // Use _exit to avoid atexit handlers
+    emergencyExit();
 }
 
 // Signal handlers
@@ -193,7 +217,7 @@ bool Application::initialize() {
     
     // Setup Platform/Renderer backends
     ImGui_ImplGlfw_InitForOpenGL(window, true);
-    ImGui_ImplOpenGL3_Init("#version 130");
+    ImGui_ImplOpenGL3_Init(getImGuiGlslVersion());
     
     initializeManagers();
     
@@ -205,6 +229,9 @@ void Application::initializeWindow() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
     
     window = glfwCreateWindow(1280, 720, "CodeForge - C++ IDE", nullptr, nullptr);
     if (!window) {
