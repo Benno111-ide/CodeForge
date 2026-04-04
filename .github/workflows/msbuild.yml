@@ -26,6 +26,7 @@ jobs:
             executable_path: build/bin/Release/CodeForge.exe
             archive: codeforge-windows-build-${{ github.run_number }}.zip
             generator: Visual Studio 17 2022
+            architecture: x64
           - os: macos-latest
             label: macos
             executable: CodeForge
@@ -49,7 +50,7 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G "${{ matrix.generator }}" -A "${{ matrix.architecture }}"
 
       - name: Build
         run: cmake --build build --config Release

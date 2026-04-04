@@ -7,6 +7,7 @@
 #include <chrono>
 #include <regex>
 #include <filesystem>
+#include <cstdio>
 
 #ifdef _WIN32
 #define CODEFORGE_POPEN _popen
