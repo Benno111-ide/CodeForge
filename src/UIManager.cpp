@@ -2,6 +2,7 @@
 #include "../include/CodeEditor.h"
 #include "../include/Application.h"
 #include "../include/CompilerEngine.h"
+#include "../include/GitManager.h"
 #include "FileManager.h"
 #include "ProjectManager.h"
 #include "SettingsManager.h"
@@ -17,9 +18,94 @@
 #include <ctime>
 #include <exception>
 #include <cfloat>
+#include <cstring>
+#include <cstdlib>
+#include <cctype>
+
+namespace {
+
+std::string toLowerCopy(const std::string& value) {
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return lowered;
+}
+
+bool isSupportedWorkspaceFile(const std::string& filename, const std::string& extension) {
+    const std::string normalizedName = toLowerCopy(filename);
+    const std::string normalizedExtension = toLowerCopy(extension);
+
+    if (normalizedName == "cmakelists.txt" || normalizedName == "makefile" ||
+        normalizedName == ".gitignore" || normalizedName == "agents.md" ||
+        normalizedName == "skill.md" || normalizedName == "harness.json" ||
+        normalizedName == "package.json" || normalizedName == "package-lock.json" ||
+        normalizedName == "pyproject.toml" || normalizedName == "requirements.txt") {
+        return true;
+    }
+
+    return normalizedExtension == ".cpp" || normalizedExtension == ".h" ||
+           normalizedExtension == ".hpp" || normalizedExtension == ".c" ||
+           normalizedExtension == ".cc" || normalizedExtension == ".cxx" ||
+           normalizedExtension == ".txt" || normalizedExtension == ".md" ||
+           normalizedExtension == ".cmake" || normalizedExtension == ".py" ||
+           normalizedExtension == ".js" || normalizedExtension == ".ts" ||
+           normalizedExtension == ".tsx" || normalizedExtension == ".jsx" ||
+           normalizedExtension == ".json" || normalizedExtension == ".yaml" ||
+           normalizedExtension == ".yml" || normalizedExtension == ".toml" ||
+           normalizedExtension == ".sh" || normalizedExtension == ".ps1" ||
+           normalizedExtension == ".cfproj" ||
+           normalizedExtension == ".java" || normalizedExtension == ".cs";
+}
+
+std::string getWorkspaceFileIcon(const std::string& filename, const std::string& extension) {
+    const std::string normalizedName = toLowerCopy(filename);
+    const std::string normalizedExtension = toLowerCopy(extension);
+
+    if (normalizedName == "cmakelists.txt" || normalizedName == "makefile" ||
+        normalizedExtension == ".cfproj" ||
+        normalizedName == "harness.json") {
+        return "CFG";
+    }
+
+    if (normalizedName == "agents.md" || normalizedName == "skill.md") {
+        return "AI";
+    }
+
+    if (normalizedName == ".gitignore" || normalizedName == "package.json" ||
+        normalizedName == "package-lock.json" || normalizedName == "pyproject.toml" ||
+        normalizedName == "requirements.txt" || normalizedExtension == ".json" ||
+        normalizedExtension == ".yaml" || normalizedExtension == ".yml" ||
+        normalizedExtension == ".toml") {
+        return "SET";
+    }
+
+    if (normalizedExtension == ".cpp" || normalizedExtension == ".c") {
+        return "SRC";
+    }
+
+    if (normalizedExtension == ".h" || normalizedExtension == ".hpp") {
+        return "HDR";
+    }
+
+    if (normalizedExtension == ".md" || normalizedExtension == ".txt") {
+        return "DOC";
+    }
+
+    if (normalizedExtension == ".py" || normalizedExtension == ".js" ||
+        normalizedExtension == ".ts" || normalizedExtension == ".tsx" ||
+        normalizedExtension == ".jsx" || normalizedExtension == ".sh" ||
+        normalizedExtension == ".ps1") {
+        return "RUN";
+    }
+
+    return "FILE";
+}
+
+}  // namespace
 
 UIManager::UIManager() {
     codeEditor = std::make_unique<CodeEditor>();
+    gitManager = std::make_unique<GitManager>();
     codeEditor->setLineNumbers(false);      // Hide line numbers by default
     codeEditor->setAutoScroll(false);       // Disable automatic cursor-driven scrolling
     
@@ -102,12 +188,13 @@ void UIManager::render() {
             }
             if (ImGui::IsKeyPressed(ImGuiKey_S)) {
                 if (codeEditor) {
-                    codeEditor->saveFile("untitled.cpp");
+                    codeEditor->saveFile(currentFile.empty() ? "untitled.cpp" : currentFile);
                 }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_N)) {
                 if (codeEditor) {
                     codeEditor->clear();
+                    currentFile.clear();
                 }
             }
         }
@@ -136,6 +223,10 @@ void UIManager::render() {
         
         if (showProjectManager) {
             renderProjectManager();
+        }
+
+        if (showGitWindow) {
+            renderGitWindow();
         }
         
         if (showSettingsWindow) {
@@ -239,6 +330,12 @@ void UIManager::renderMainMenuBar() {
             handleViewMenu();
         } catch (...) {
             std::cerr << "Exception in View menu" << std::endl;
+        }
+
+        try {
+            handleGitMenu();
+        } catch (...) {
+            std::cerr << "Exception in Git menu" << std::endl;
         }
         
         try {
@@ -381,8 +478,11 @@ void UIManager::renderProjectManager() {
         if (currentProject) {
             // Project info header
             ImGui::Text("Project: %s", currentProject->name.c_str());
+            ImGui::Text("Type: %s", currentProject->projectType.c_str());
             ImGui::Text("Path: %s", currentProject->rootPath.c_str());
             ImGui::Text("Build Target: %s", currentProject->buildTarget.c_str());
+            ImGui::Text("Git: %s",
+                        currentProject->gitEnabled ? currentProject->gitBranch.c_str() : "Not initialized");
             
             ImGui::Separator();
             
@@ -456,6 +556,81 @@ void UIManager::renderProjectManager() {
     ImGui::End();
 }
 
+void UIManager::renderGitWindow() {
+    ImGui::SetNextWindowSizeConstraints(ImVec2(420, 280), ImVec2(FLT_MAX, FLT_MAX));
+    if (ImGui::Begin("Git", &showGitWindow)) {
+        if (!gitManager || !gitManager->isGitAvailable()) {
+            ImGui::TextWrapped("Git is not available on PATH.");
+            ImGui::End();
+            return;
+        }
+
+        if (!currentProject) {
+            ImGui::TextWrapped("Open or create a project to use Git features.");
+            ImGui::End();
+            return;
+        }
+
+        ImGui::Text("Repository: %s",
+                    currentProject->gitEnabled ? currentProject->gitRepositoryRoot.c_str() : "Not initialized");
+        ImGui::Text("Branch: %s",
+                    currentProject->gitEnabled ? currentProject->gitBranch.c_str() : "-");
+
+        ImGui::Separator();
+
+        if (!currentProject->gitEnabled) {
+            if (ImGui::Button("Initialize Git Repository")) {
+                initializeProjectGitRepository();
+            }
+        } else {
+            if (ImGui::Button("Refresh Status")) {
+                refreshGitState();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Stage All")) {
+                runGitStageAll();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pull")) {
+                runGitPull();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Push")) {
+                runGitPush();
+            }
+
+            char commitBuffer[512] = {};
+            strncpy(commitBuffer, gitCommitMessage.c_str(), sizeof(commitBuffer) - 1);
+            if (ImGui::InputText("Commit Message", commitBuffer, sizeof(commitBuffer))) {
+                gitCommitMessage = commitBuffer;
+            }
+
+            if (ImGui::Button("Commit")) {
+                runGitCommit();
+            }
+
+            ImGui::Separator();
+            ImGui::Text("Status");
+            ImGui::BeginChild("GitStatusList", ImVec2(0, 120), true);
+            if (gitStatusLines.empty()) {
+                ImGui::TextUnformatted("Working tree clean.");
+            } else {
+                for (const auto& line : gitStatusLines) {
+                    ImGui::TextWrapped("%s", line.c_str());
+                }
+            }
+            ImGui::EndChild();
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Output");
+        ImGui::BeginChild("GitOutput", ImVec2(0, 0), true);
+        ImGui::TextWrapped("%s", gitOutput.empty() ? "No Git operations yet." : gitOutput.c_str());
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
 void UIManager::renderSettingsWindow() {
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 360), ImVec2(FLT_MAX, FLT_MAX));
     if (ImGui::Begin("Settings", &showSettingsWindow)) {
@@ -499,15 +674,14 @@ void UIManager::handleFileMenu() {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("New", "Ctrl+N")) {
             codeEditor->clear();
+            currentFile.clear();
         }
         if (ImGui::MenuItem("Open", "Ctrl+O")) {
             showOpenFileDialog = true;
         }
         if (ImGui::MenuItem("Save", "Ctrl+S")) {
-            // TODO: Implement save to current file or show save dialog
             if (codeEditor) {
-                // For now, save to a default file
-                codeEditor->saveFile("untitled.cpp");
+                codeEditor->saveFile(currentFile.empty() ? "untitled.cpp" : currentFile);
             }
         }
         if (ImGui::MenuItem("Save As", "Ctrl+Shift+S")) {
@@ -535,6 +709,9 @@ void UIManager::handleProjectMenu() {
         }
         if (ImGui::MenuItem("Close Project", nullptr, false, currentProject != nullptr)) {
             currentProject = nullptr;
+            gitStatusLines.clear();
+            gitOutput.clear();
+            gitCommitMessage.clear();
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Project Settings", nullptr, false, currentProject != nullptr)) {
@@ -627,6 +804,7 @@ void UIManager::handleViewMenu() {
         ImGui::MenuItem("Output", nullptr, &showOutputWindow);
         ImGui::MenuItem("Project", nullptr, &showProjectWindow);
         ImGui::MenuItem("Project Manager", nullptr, &showProjectManager);
+        ImGui::MenuItem("Git", nullptr, &showGitWindow);
         if (ImGui::MenuItem("Toggle Fullscreen", "F11")) {
             if (Application::getInstance()) {
                 Application::getInstance()->toggleFullscreen();
@@ -634,6 +812,36 @@ void UIManager::handleViewMenu() {
         }
         ImGui::Separator();
         ImGui::MenuItem("Settings", nullptr, &showSettingsWindow);
+        ImGui::EndMenu();
+    }
+}
+
+void UIManager::handleGitMenu() {
+    if (ImGui::BeginMenu("Git")) {
+        bool hasProject = currentProject != nullptr;
+        bool hasRepo = hasProject && currentProject->gitEnabled;
+
+        if (ImGui::MenuItem("Git Window", nullptr, &showGitWindow)) {
+        }
+        if (ImGui::MenuItem("Refresh Status", nullptr, false, hasRepo)) {
+            refreshGitState();
+        }
+        if (ImGui::MenuItem("Initialize Repository", nullptr, false, hasProject && !hasRepo)) {
+            initializeProjectGitRepository();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Stage All", nullptr, false, hasRepo)) {
+            runGitStageAll();
+        }
+        if (ImGui::MenuItem("Commit", nullptr, false, hasRepo)) {
+            runGitCommit();
+        }
+        if (ImGui::MenuItem("Pull", nullptr, false, hasRepo)) {
+            runGitPull();
+        }
+        if (ImGui::MenuItem("Push", nullptr, false, hasRepo)) {
+            runGitPush();
+        }
         ImGui::EndMenu();
     }
 }
@@ -851,10 +1059,7 @@ void UIManager::refreshDirectoryContents() {
                     std::string extension = entry.path().extension().string();
                     
                     // Filter for code files
-                    if (extension == ".cpp" || extension == ".h" || extension == ".hpp" || 
-                        extension == ".c" || extension == ".cc" || extension == ".cxx" ||
-                        extension == ".txt" || extension == ".md" || extension == ".py" ||
-                        extension == ".js" || extension == ".java" || extension == ".cs") {
+                    if (isSupportedWorkspaceFile(filename, extension)) {
                         directoryFiles.push_back(filename);
                     }
                 }
@@ -922,9 +1127,13 @@ void UIManager::renderFileDialog() {
                 if (ImGui::Selectable(("📄 " + file).c_str(), isSelected, ImGuiSelectableFlags_AllowDoubleClick)) {
                     selectedFileName = file;
                     if (ImGui::IsMouseDoubleClicked(0)) {
-                        // Open the file
                         std::string fullPath = (std::filesystem::path(currentDirectory) / file).string();
-                        if (codeEditor && codeEditor->loadFile(fullPath)) {
+                        if (std::filesystem::path(fullPath).extension() == ".cfproj") {
+                            loadProject(fullPath);
+                            showOpenFileDialog = false;
+                            selectedFileName.clear();
+                        } else if (codeEditor && codeEditor->loadFile(fullPath)) {
+                            currentFile = fullPath;
                             showOpenFileDialog = false;
                             selectedFileName.clear();
                         }
@@ -938,7 +1147,12 @@ void UIManager::renderFileDialog() {
             ImGui::Separator();
             if (ImGui::Button("Open") && !selectedFileName.empty()) {
                 std::string fullPath = (std::filesystem::path(currentDirectory) / selectedFileName).string();
-                if (codeEditor && codeEditor->loadFile(fullPath)) {
+                if (std::filesystem::path(fullPath).extension() == ".cfproj") {
+                    loadProject(fullPath);
+                    showOpenFileDialog = false;
+                    selectedFileName.clear();
+                } else if (codeEditor && codeEditor->loadFile(fullPath)) {
+                    currentFile = fullPath;
                     showOpenFileDialog = false;
                     selectedFileName.clear();
                 }
@@ -956,50 +1170,123 @@ void UIManager::renderFileDialog() {
 // Advanced Project Manager Implementation
 void UIManager::createNewProject(const std::string& name, const std::string& path) {
     try {
+        static const char* templates[] = {
+            "Console Application",
+            "Static Library",
+            "Shared Library",
+            "Codex Harness"
+        };
+
         // Create project directory
         std::filesystem::path projectPath = std::filesystem::path(path) / name;
         std::filesystem::create_directories(projectPath);
-        
-        // Create subdirectories
-        std::filesystem::create_directories(projectPath / "src");
-        std::filesystem::create_directories(projectPath / "include");
-        std::filesystem::create_directories(projectPath / "build");
+
         std::filesystem::create_directories(projectPath / "docs");
+        if (newProjectTemplate == 3) {
+            std::filesystem::create_directories(projectPath / "prompts");
+            std::filesystem::create_directories(projectPath / "scripts");
+            std::filesystem::create_directories(projectPath / "tasks");
+            std::filesystem::create_directories(projectPath / ".codex");
+        } else {
+            std::filesystem::create_directories(projectPath / "src");
+            std::filesystem::create_directories(projectPath / "include");
+            std::filesystem::create_directories(projectPath / "build");
+        }
         
         // Create a new project
         auto project = std::make_shared<Project>();
         project->name = name;
         project->rootPath = projectPath.string();
         project->configFile = (projectPath / (name + ".cfproj")).string();
+        project->projectType = templates[newProjectTemplate];
         project->buildTarget = name;
         project->buildConfiguration = "Debug";
+        project->autoInitializeGit = initializeGitForNewProjects;
         
         // Create root folder structure
         project->rootFolder = std::make_shared<ProjectFolder>();
         project->rootFolder->name = name;
         project->rootFolder->path = project->rootPath;
         
-        // Create basic project files
-        std::string mainCppPath = (projectPath / "src" / "main.cpp").string();
-        std::ofstream mainFile(mainCppPath);
-        mainFile << "#include <iostream>\n\nint main() {\n";
-        mainFile << "    std::cout << \"Hello, " << name << "!\" << std::endl;\n";
-        mainFile << "    return 0;\n}\n";
-        mainFile.close();
-        
-        // Create CMakeLists.txt
-        std::string cmakeListsPath = (projectPath / "CMakeLists.txt").string();
-        std::ofstream cmakeFile(cmakeListsPath);
-        cmakeFile << "cmake_minimum_required(VERSION 3.10)\n";
-        cmakeFile << "project(" << name << ")\n\n";
-        cmakeFile << "set(CMAKE_CXX_STANDARD 17)\n";
-        cmakeFile << "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n";
-        cmakeFile << "file(GLOB SOURCES \"src/*.cpp\")\n";
-        cmakeFile << "add_executable(" << name << " ${SOURCES})\n\n";
-        cmakeFile << "target_include_directories(" << name << " PRIVATE include)\n";
-        cmakeFile.close();
+        if (newProjectTemplate == 3) {
+            std::ofstream readmeFile((projectPath / "README.md").string());
+            readmeFile << "# " << name << "\n\n";
+            readmeFile << "Codex harness workspace for prompts, scripts, and repeatable tasks.\n";
+            readmeFile.close();
+
+            std::ofstream agentsFile((projectPath / "AGENTS.md").string());
+            agentsFile << "# Agent Guidelines\n\n";
+            agentsFile << "- Keep prompts task-focused and reproducible.\n";
+            agentsFile << "- Store reusable helpers in `scripts/`.\n";
+            agentsFile << "- Capture task inputs and expected outputs in `tasks/`.\n";
+            agentsFile.close();
+
+            std::ofstream harnessFile((projectPath / "harness.json").string());
+            harnessFile << "{\n";
+            harnessFile << "  \"name\": \"" << name << "\",\n";
+            harnessFile << "  \"runner\": \"codex\",\n";
+            harnessFile << "  \"tasksDir\": \"tasks\",\n";
+            harnessFile << "  \"promptsDir\": \"prompts\",\n";
+            harnessFile << "  \"scriptsDir\": \"scripts\"\n";
+            harnessFile << "}\n";
+            harnessFile.close();
+
+            std::ofstream taskFile((projectPath / "tasks" / "example-task.md").string());
+            taskFile << "# Example Task\n\n";
+            taskFile << "Describe the change to make, the files in scope, and the validation steps.\n";
+            taskFile.close();
+
+            std::ofstream promptFile((projectPath / "prompts" / "system.md").string());
+            promptFile << "You are working inside the " << name << " Codex harness workspace.\n";
+            promptFile.close();
+
+            std::ofstream scriptFile((projectPath / "scripts" / "run_harness.ps1").string());
+            scriptFile << "param(\n";
+            scriptFile << "    [string]$Task = \"tasks/example-task.md\"\n";
+            scriptFile << ")\n\n";
+            scriptFile << "Write-Host \"Run Codex against $Task using the workspace prompt files.\"\n";
+            scriptFile.close();
+        } else {
+            std::string mainCppPath = (projectPath / "src" / "main.cpp").string();
+            std::ofstream mainFile(mainCppPath);
+            mainFile << "#include <iostream>\n\nint main() {\n";
+            mainFile << "    std::cout << \"Hello, " << name << "!\" << std::endl;\n";
+            mainFile << "    return 0;\n}\n";
+            mainFile.close();
+
+            std::string cmakeListsPath = (projectPath / "CMakeLists.txt").string();
+            std::ofstream cmakeFile(cmakeListsPath);
+            cmakeFile << "cmake_minimum_required(VERSION 3.10)\n";
+            cmakeFile << "project(" << name << ")\n\n";
+            cmakeFile << "set(CMAKE_CXX_STANDARD 17)\n";
+            cmakeFile << "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n\n";
+            cmakeFile << "file(GLOB SOURCES \"src/*.cpp\")\n";
+            if (newProjectTemplate == 1) {
+                cmakeFile << "add_library(" << name << " STATIC ${SOURCES})\n\n";
+            } else if (newProjectTemplate == 2) {
+                cmakeFile << "add_library(" << name << " SHARED ${SOURCES})\n\n";
+            } else {
+                cmakeFile << "add_executable(" << name << " ${SOURCES})\n\n";
+            }
+            cmakeFile << "target_include_directories(" << name << " PRIVATE include)\n";
+            cmakeFile.close();
+        }
+
+        if (initializeGitForNewProjects) {
+            std::ofstream gitignoreFile((projectPath / ".gitignore").string());
+            gitignoreFile << "build/\n";
+            gitignoreFile << "*.o\n";
+            gitignoreFile << "*.obj\n";
+            gitignoreFile << "*.exe\n";
+            gitignoreFile << "*.out\n";
+            gitignoreFile << "*.pdb\n";
+            gitignoreFile.close();
+        }
         
         currentProject = project;
+        if (currentProject->autoInitializeGit) {
+            initializeProjectGitRepository();
+        }
         scanProjectFiles(project->rootFolder);
         saveProject();
         
@@ -1031,10 +1318,26 @@ void UIManager::loadProject(const std::string& configPath) {
                 project->name = line.substr(5);
             } else if (line.substr(0, 10) == "root_path=") {
                 project->rootPath = line.substr(10);
+            } else if (line.substr(0, 13) == "project_type=") {
+                project->projectType = line.substr(13);
             } else if (line.substr(0, 13) == "build_target=") {
                 project->buildTarget = line.substr(13);
             } else if (line.substr(0, 13) == "build_config=") {
                 project->buildConfiguration = line.substr(13);
+            } else if (line.substr(0, 13) == "include_path=") {
+                project->includePaths.push_back(line.substr(13));
+            } else if (line.substr(0, 13) == "library_path=") {
+                project->libraryPaths.push_back(line.substr(13));
+            } else if (line.substr(0, 8) == "library=") {
+                project->libraries.push_back(line.substr(8));
+            } else if (line.substr(0, 12) == "git_enabled=") {
+                project->gitEnabled = (line.substr(12) == "true");
+            } else if (line.substr(0, 9) == "git_root=") {
+                project->gitRepositoryRoot = line.substr(9);
+            } else if (line.substr(0, 11) == "git_branch=") {
+                project->gitBranch = line.substr(11);
+            } else if (line.substr(0, 14) == "git_auto_init=") {
+                project->autoInitializeGit = (line.substr(14) == "true");
             }
         }
         
@@ -1047,6 +1350,11 @@ void UIManager::loadProject(const std::string& configPath) {
         
         currentProject = project;
         scanProjectFiles(project->rootFolder);
+        refreshGitState();
+        recentProjects.insert(recentProjects.begin(), project);
+        if (recentProjects.size() > 10) {
+            recentProjects.resize(10);
+        }
         
     } catch (const std::exception& e) {
         std::cerr << "Error loading project: " << e.what() << std::endl;
@@ -1060,8 +1368,13 @@ void UIManager::saveProject() {
         std::ofstream configFile(currentProject->configFile);
         configFile << "name=" << currentProject->name << "\n";
         configFile << "root_path=" << currentProject->rootPath << "\n";
+        configFile << "project_type=" << currentProject->projectType << "\n";
         configFile << "build_target=" << currentProject->buildTarget << "\n";
         configFile << "build_config=" << currentProject->buildConfiguration << "\n";
+        configFile << "git_enabled=" << (currentProject->gitEnabled ? "true" : "false") << "\n";
+        configFile << "git_root=" << currentProject->gitRepositoryRoot << "\n";
+        configFile << "git_branch=" << currentProject->gitBranch << "\n";
+        configFile << "git_auto_init=" << (currentProject->autoInitializeGit ? "true" : "false") << "\n";
         
         for (const auto& includePath : currentProject->includePaths) {
             configFile << "include_path=" << includePath << "\n";
@@ -1081,6 +1394,88 @@ void UIManager::saveProject() {
     }
 }
 
+void UIManager::refreshGitState() {
+    gitStatusLines.clear();
+
+    if (!currentProject || !gitManager || !gitManager->isGitAvailable()) {
+        return;
+    }
+
+    std::string repoRoot = gitManager->findRepositoryRoot(currentProject->rootPath);
+    currentProject->gitEnabled = !repoRoot.empty();
+    currentProject->gitRepositoryRoot = repoRoot;
+    currentProject->gitBranch = currentProject->gitEnabled ? gitManager->getCurrentBranch(repoRoot) : "";
+
+    if (!currentProject->gitEnabled) {
+        return;
+    }
+
+    std::vector<GitStatusEntry> entries = gitManager->getStatus(currentProject->gitRepositoryRoot);
+    for (const auto& entry : entries) {
+        gitStatusLines.push_back(entry.indexStatus + entry.workTreeStatus + " " + entry.path);
+    }
+}
+
+void UIManager::appendGitOutput(const std::string& message) {
+    gitOutput = message;
+}
+
+void UIManager::runGitStageAll() {
+    if (!currentProject || !currentProject->gitEnabled) {
+        return;
+    }
+
+    GitOperationResult result = gitManager->stageAll(currentProject->gitRepositoryRoot);
+    appendGitOutput(result.output.empty() ? (result.success ? "Staged all files." : "Failed to stage files.") : result.output);
+    refreshGitState();
+    saveProject();
+}
+
+void UIManager::runGitCommit() {
+    if (!currentProject || !currentProject->gitEnabled || gitCommitMessage.empty()) {
+        return;
+    }
+
+    GitOperationResult result = gitManager->commit(currentProject->gitRepositoryRoot, gitCommitMessage);
+    appendGitOutput(result.output.empty() ? (result.success ? "Commit created." : "Commit failed.") : result.output);
+    if (result.success) {
+        gitCommitMessage.clear();
+    }
+    refreshGitState();
+    saveProject();
+}
+
+void UIManager::runGitPull() {
+    if (!currentProject || !currentProject->gitEnabled) {
+        return;
+    }
+
+    GitOperationResult result = gitManager->pull(currentProject->gitRepositoryRoot);
+    appendGitOutput(result.output.empty() ? (result.success ? "Pull completed." : "Pull failed.") : result.output);
+    refreshGitState();
+}
+
+void UIManager::runGitPush() {
+    if (!currentProject || !currentProject->gitEnabled) {
+        return;
+    }
+
+    GitOperationResult result = gitManager->push(currentProject->gitRepositoryRoot);
+    appendGitOutput(result.output.empty() ? (result.success ? "Push completed." : "Push failed.") : result.output);
+    refreshGitState();
+}
+
+void UIManager::initializeProjectGitRepository() {
+    if (!currentProject || !gitManager) {
+        return;
+    }
+
+    GitOperationResult result = gitManager->initRepository(currentProject->rootPath);
+    appendGitOutput(result.output.empty() ? (result.success ? "Repository initialized." : "Repository initialization failed.") : result.output);
+    refreshGitState();
+    saveProject();
+}
+
 void UIManager::scanProjectFiles(std::shared_ptr<ProjectFolder> folder) {
     if (!folder) return;
     
@@ -1091,6 +1486,9 @@ void UIManager::scanProjectFiles(std::shared_ptr<ProjectFolder> folder) {
         if (std::filesystem::exists(folder->path)) {
             for (const auto& entry : std::filesystem::directory_iterator(folder->path)) {
                 if (entry.is_directory()) {
+                    if (entry.path().filename() == ".git") {
+                        continue;
+                    }
                     auto subFolder = std::make_shared<ProjectFolder>();
                     subFolder->name = entry.path().filename().string();
                     subFolder->path = entry.path().string();
@@ -1105,10 +1503,7 @@ void UIManager::scanProjectFiles(std::shared_ptr<ProjectFolder> folder) {
                     file.extension = entry.path().extension().string();
                     
                     // Only include relevant file types
-                    if (file.extension == ".cpp" || file.extension == ".h" || file.extension == ".hpp" ||
-                        file.extension == ".c" || file.extension == ".cc" || file.extension == ".cxx" ||
-                        file.extension == ".txt" || file.extension == ".md" || file.extension == ".cmake" ||
-                        file.name == "CMakeLists.txt" || file.name == "Makefile") {
+                    if (isSupportedWorkspaceFile(file.name, file.extension)) {
                         folder->files.push_back(file);
                     }
                 }
@@ -1155,6 +1550,7 @@ void UIManager::renderProjectTree(std::shared_ptr<ProjectFolder> folder) {
         else if (file.extension == ".cmake" || file.name == "CMakeLists.txt") icon = "⚙️";
         else if (file.extension == ".md") icon = "📖";
         
+        icon = getWorkspaceFileIcon(file.name, file.extension);
         std::string displayName = icon + " " + file.name;
         if (file.isModified) displayName += " *";
         
@@ -1163,6 +1559,7 @@ void UIManager::renderProjectTree(std::shared_ptr<ProjectFolder> folder) {
                 // Open file in editor
                 if (codeEditor && codeEditor->loadFile(file.fullPath)) {
                     file.isOpen = true;
+                    currentFile = file.fullPath;
                 }
             }
         }
@@ -1173,6 +1570,7 @@ void UIManager::renderProjectTree(std::shared_ptr<ProjectFolder> folder) {
                 if (codeEditor) {
                     codeEditor->loadFile(file.fullPath);
                     file.isOpen = true;
+                    currentFile = file.fullPath;
                 }
             }
             if (ImGui::MenuItem("Remove from Project")) {
@@ -1219,9 +1617,14 @@ void UIManager::renderCreateProjectDialog() {
             }
             
             // Project template
-            static int selectedTemplate = 0;
-            const char* templates[] = { "Console Application", "Static Library", "Shared Library" };
-            ImGui::Combo("Template", &selectedTemplate, templates, 3);
+            const char* templates[] = {
+                "Console Application",
+                "Static Library",
+                "Shared Library",
+                "Codex Harness"
+            };
+            ImGui::Combo("Template", &newProjectTemplate, templates, 4);
+            ImGui::Checkbox("Initialize Git repository", &initializeGitForNewProjects);
             
             ImGui::Separator();
             
@@ -1231,12 +1634,14 @@ void UIManager::renderCreateProjectDialog() {
                 showCreateProjectDialog = false;
                 newProjectName.clear();
                 newProjectPath.clear();
+                newProjectTemplate = 0;
             }
             ImGui::SameLine();
             if (ImGui::Button("Cancel")) {
                 showCreateProjectDialog = false;
                 newProjectName.clear();
                 newProjectPath.clear();
+                newProjectTemplate = 0;
             }
         }
         ImGui::End();
@@ -1254,6 +1659,8 @@ void UIManager::renderProjectSettings() {
                 if (ImGui::InputText("Project Name", nameBuffer, sizeof(nameBuffer))) {
                     currentProject->name = nameBuffer;
                 }
+
+                ImGui::Text("Project Type: %s", currentProject->projectType.c_str());
                 
                 char targetBuffer[256] = {};
                 strncpy(targetBuffer, currentProject->buildTarget.c_str(), sizeof(targetBuffer) - 1);
@@ -1273,6 +1680,24 @@ void UIManager::renderProjectSettings() {
                 }
                 if (ImGui::Combo("Configuration", &currentConfig, configs, 4)) {
                     currentProject->buildConfiguration = configs[currentConfig];
+                }
+            }
+
+            if (ImGui::CollapsingHeader("Git", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Checkbox("Enable Git for this project", &currentProject->autoInitializeGit);
+                ImGui::Text("Repository: %s",
+                            currentProject->gitEnabled ? currentProject->gitRepositoryRoot.c_str() : "Not initialized");
+                ImGui::Text("Branch: %s",
+                            currentProject->gitEnabled ? currentProject->gitBranch.c_str() : "-");
+
+                if (!currentProject->gitEnabled) {
+                    if (ImGui::Button("Initialize Repository")) {
+                        initializeProjectGitRepository();
+                    }
+                } else {
+                    if (ImGui::Button("Refresh Git Status")) {
+                        refreshGitState();
+                    }
                 }
             }
             

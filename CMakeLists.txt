@@ -115,6 +115,7 @@ add_executable(CodeForge
     src/CodeEditor.cpp
     src/CompilerEngine.cpp
     src/FileManager.cpp
+    src/GitManager.cpp
     src/ProjectManager.cpp
     src/SettingsManager.cpp
     src/UIManager.cpp
