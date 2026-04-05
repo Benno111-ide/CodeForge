@@ -2,6 +2,7 @@
 #include "../include/CodeEditor.h"
 #include "../include/Application.h"
 #include "../include/CompilerEngine.h"
+#include "../include/CodexManager.h"
 #include "../include/GitManager.h"
 #include "FileManager.h"
 #include "ProjectManager.h"
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <chrono>
 
 namespace {
 
@@ -105,6 +107,7 @@ std::string getWorkspaceFileIcon(const std::string& filename, const std::string&
 
 UIManager::UIManager() {
     codeEditor = std::make_unique<CodeEditor>();
+    codexManager = std::make_unique<CodexManager>();
     gitManager = std::make_unique<GitManager>();
     codeEditor->setLineNumbers(false);      // Hide line numbers by default
     codeEditor->setAutoScroll(false);       // Disable automatic cursor-driven scrolling
@@ -175,7 +178,15 @@ UIManager::~UIManager() = default;
 
 void UIManager::update(float deltaTime) {
     (void)deltaTime;  // Suppress unused parameter warning
-    // Update UI state
+    if (codexRunInProgress &&
+        codexFuture.valid() &&
+        codexFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        CodexRunResult result = codexFuture.get();
+        codexRunInProgress = false;
+        codexLastCommand = result.command;
+        codexOutput = result.output.empty() ? (result.success ? "Codex completed successfully." : "Codex finished without output.") : result.output;
+        codexStatusMessage = result.success ? "Last run succeeded" : "Last run failed";
+    }
 }
 
 void UIManager::render() {
@@ -227,6 +238,10 @@ void UIManager::render() {
 
         if (showGitWindow) {
             renderGitWindow();
+        }
+
+        if (showCodexWindow) {
+            renderCodexWindow();
         }
         
         if (showSettingsWindow) {
@@ -336,6 +351,12 @@ void UIManager::renderMainMenuBar() {
             handleGitMenu();
         } catch (...) {
             std::cerr << "Exception in Git menu" << std::endl;
+        }
+
+        try {
+            handleCodexMenu();
+        } catch (...) {
+            std::cerr << "Exception in Codex menu" << std::endl;
         }
         
         try {
@@ -548,6 +569,8 @@ void UIManager::renderProjectManager() {
                         if (currentProject->rootFolder) {
                             scanProjectFiles(currentProject->rootFolder);
                         }
+                        refreshCodexTaskFiles();
+                        refreshGitState();
                     }
                 }
             }
@@ -626,6 +649,138 @@ void UIManager::renderGitWindow() {
         ImGui::Text("Output");
         ImGui::BeginChild("GitOutput", ImVec2(0, 0), true);
         ImGui::TextWrapped("%s", gitOutput.empty() ? "No Git operations yet." : gitOutput.c_str());
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
+
+void UIManager::renderCodexWindow() {
+    ImGui::SetNextWindowSizeConstraints(ImVec2(480, 320), ImVec2(FLT_MAX, FLT_MAX));
+    if (ImGui::Begin("Codex", &showCodexWindow)) {
+        const std::string workingRoot = currentProject ? currentProject->rootPath : currentDirectory;
+        const bool codexAvailable = codexManager && codexManager->isCodexAvailable();
+
+        ImGui::Text("Status: %s", codexStatusMessage.c_str());
+        ImGui::TextWrapped("Workspace: %s", workingRoot.c_str());
+
+        if (!codexAvailable) {
+            ImGui::Separator();
+            ImGui::TextWrapped("Codex CLI is not available on PATH.");
+            ImGui::End();
+            return;
+        }
+
+        char modelBuffer[128] = {};
+        strncpy(modelBuffer, codexModel.c_str(), sizeof(modelBuffer) - 1);
+        if (ImGui::InputText("Model", modelBuffer, sizeof(modelBuffer))) {
+            codexModel = modelBuffer;
+        }
+
+        const char* sandboxModes[] = {
+            "Read Only",
+            "Workspace Write",
+            "Danger Full Access"
+        };
+        ImGui::Checkbox("Full Auto", &codexUseFullAuto);
+        if (!codexUseFullAuto) {
+            ImGui::Combo("Sandbox", &codexSandboxMode, sandboxModes, 3);
+        }
+        ImGui::Checkbox("Ephemeral Session", &codexEphemeral);
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh Tasks")) {
+            refreshCodexTaskFiles();
+        }
+
+        if (!codexTaskFiles.empty()) {
+            std::vector<const char*> taskItems;
+            taskItems.reserve(codexTaskFiles.size());
+            for (const auto& task : codexTaskFiles) {
+                taskItems.push_back(task.c_str());
+            }
+            if (codexSelectedTaskFile < 0 || codexSelectedTaskFile >= static_cast<int>(codexTaskFiles.size())) {
+                codexSelectedTaskFile = 0;
+            }
+            ImGui::Combo("Harness Task", &codexSelectedTaskFile, taskItems.data(), static_cast<int>(taskItems.size()));
+        }
+
+        char promptBuffer[4096] = {};
+        strncpy(promptBuffer, codexPrompt.c_str(), sizeof(promptBuffer) - 1);
+        if (ImGui::InputTextMultiline("Prompt", promptBuffer, sizeof(promptBuffer), ImVec2(-1, 120))) {
+            codexPrompt = promptBuffer;
+        }
+
+        const bool canRunPrompt = !codexRunInProgress && (!codexPrompt.empty() || !codexTaskFiles.empty());
+        if (ImGui::Button("Run Prompt") && canRunPrompt) {
+            CodexRunOptions options;
+            options.workingDirectory = workingRoot;
+            options.model = codexModel;
+            options.useFullAuto = codexUseFullAuto;
+            options.ephemeral = codexEphemeral;
+            options.skipGitRepoCheck = true;
+            static const char* sandboxValues[] = { "read-only", "workspace-write", "danger-full-access" };
+            options.sandboxMode = sandboxValues[codexSandboxMode];
+
+            std::string prompt = codexPrompt;
+            if (!codexTaskFiles.empty() &&
+                codexSelectedTaskFile >= 0 &&
+                codexSelectedTaskFile < static_cast<int>(codexTaskFiles.size())) {
+                prompt += "\n\nPlease follow the task file `" + codexTaskFiles[codexSelectedTaskFile] + "`.";
+            }
+            if (!currentFile.empty()) {
+                prompt += "\nCurrent file in editor: `" + currentFile + "`.";
+            }
+            if (prompt.empty()) {
+                prompt = "Review the current workspace and summarize the next best change to make.";
+            }
+            options.prompt = prompt;
+
+            codexOutput = "Running Codex...";
+            codexStatusMessage = "Running prompt";
+            codexRunInProgress = true;
+            codexFuture = std::async(std::launch::async, [this, options]() {
+                return codexManager->runPrompt(options);
+            });
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Review Repo") && !codexRunInProgress) {
+            CodexRunOptions options;
+            options.workingDirectory = workingRoot;
+            options.model = codexModel;
+            options.useFullAuto = codexUseFullAuto;
+            options.ephemeral = codexEphemeral;
+            options.skipGitRepoCheck = true;
+            static const char* sandboxValues[] = { "read-only", "workspace-write", "danger-full-access" };
+            options.sandboxMode = sandboxValues[codexSandboxMode];
+            options.prompt = codexPrompt;
+
+            codexOutput = "Running repository review...";
+            codexStatusMessage = "Reviewing repository";
+            codexRunInProgress = true;
+            codexFuture = std::async(std::launch::async, [this, options]() {
+                return codexManager->reviewRepository(options);
+            });
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            codexPrompt.clear();
+            codexOutput.clear();
+            codexLastCommand.clear();
+            codexStatusMessage = "Idle";
+        }
+
+        if (codexRunInProgress) {
+            ImGui::TextWrapped("Codex is running. Results will appear when the command finishes.");
+        }
+
+        if (!codexLastCommand.empty()) {
+            ImGui::Separator();
+            ImGui::TextWrapped("Last command: %s", codexLastCommand.c_str());
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Output");
+        ImGui::BeginChild("CodexOutput", ImVec2(0, 0), true);
+        ImGui::TextWrapped("%s", codexOutput.empty() ? "No Codex activity yet." : codexOutput.c_str());
         ImGui::EndChild();
     }
     ImGui::End();
@@ -712,6 +867,9 @@ void UIManager::handleProjectMenu() {
             gitStatusLines.clear();
             gitOutput.clear();
             gitCommitMessage.clear();
+            codexTaskFiles.clear();
+            codexSelectedTaskFile = 0;
+            codexStatusMessage = "Idle";
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Project Settings", nullptr, false, currentProject != nullptr)) {
@@ -805,6 +963,7 @@ void UIManager::handleViewMenu() {
         ImGui::MenuItem("Project", nullptr, &showProjectWindow);
         ImGui::MenuItem("Project Manager", nullptr, &showProjectManager);
         ImGui::MenuItem("Git", nullptr, &showGitWindow);
+        ImGui::MenuItem("Codex", nullptr, &showCodexWindow);
         if (ImGui::MenuItem("Toggle Fullscreen", "F11")) {
             if (Application::getInstance()) {
                 Application::getInstance()->toggleFullscreen();
@@ -841,6 +1000,21 @@ void UIManager::handleGitMenu() {
         }
         if (ImGui::MenuItem("Push", nullptr, false, hasRepo)) {
             runGitPush();
+        }
+        ImGui::EndMenu();
+    }
+}
+
+void UIManager::handleCodexMenu() {
+    if (ImGui::BeginMenu("Codex")) {
+        ImGui::MenuItem("Codex Window", nullptr, &showCodexWindow);
+        if (ImGui::MenuItem("Clear Output")) {
+            codexOutput.clear();
+            codexLastCommand.clear();
+            codexStatusMessage = "Idle";
+        }
+        if (ImGui::MenuItem("Refresh Harness Tasks", nullptr, false, currentProject != nullptr)) {
+            refreshCodexTaskFiles();
         }
         ImGui::EndMenu();
     }
@@ -1288,6 +1462,7 @@ void UIManager::createNewProject(const std::string& name, const std::string& pat
             initializeProjectGitRepository();
         }
         scanProjectFiles(project->rootFolder);
+        refreshCodexTaskFiles();
         saveProject();
         
         // Add to recent projects
@@ -1350,6 +1525,7 @@ void UIManager::loadProject(const std::string& configPath) {
         
         currentProject = project;
         scanProjectFiles(project->rootFolder);
+        refreshCodexTaskFiles();
         refreshGitState();
         recentProjects.insert(recentProjects.begin(), project);
         if (recentProjects.size() > 10) {
@@ -1391,6 +1567,41 @@ void UIManager::saveProject() {
         configFile.close();
     } catch (const std::exception& e) {
         std::cerr << "Error saving project: " << e.what() << std::endl;
+    }
+}
+
+void UIManager::refreshCodexTaskFiles() {
+    codexTaskFiles.clear();
+
+    if (!currentProject) {
+        codexSelectedTaskFile = 0;
+        return;
+    }
+
+    std::filesystem::path taskRoot = std::filesystem::path(currentProject->rootPath) / "tasks";
+    if (!std::filesystem::exists(taskRoot) || !std::filesystem::is_directory(taskRoot)) {
+        codexSelectedTaskFile = 0;
+        return;
+    }
+
+    try {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(taskRoot)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            std::string extension = toLowerCopy(entry.path().extension().string());
+            if (extension == ".md" || extension == ".txt") {
+                codexTaskFiles.push_back(std::filesystem::relative(entry.path(), currentProject->rootPath).string());
+            }
+        }
+    } catch (const std::exception& e) {
+        codexOutput = std::string("Failed to scan Codex task files: ") + e.what();
+    }
+
+    std::sort(codexTaskFiles.begin(), codexTaskFiles.end());
+    if (codexSelectedTaskFile >= static_cast<int>(codexTaskFiles.size())) {
+        codexSelectedTaskFile = codexTaskFiles.empty() ? 0 : static_cast<int>(codexTaskFiles.size()) - 1;
     }
 }
 

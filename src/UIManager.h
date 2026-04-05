@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <future>
+#include "../include/CodexManager.h"
 
 class CodeEditor;
 class CompilerEngine;
@@ -26,6 +28,7 @@ public:
     bool showProjectWindow = false;
     bool showProjectManager = true;
     bool showGitWindow = true;
+    bool showCodexWindow = true;
     
 private:
     std::unique_ptr<CodeEditor> codeEditor;
@@ -89,6 +92,19 @@ private:
     std::vector<std::string> gitStatusLines;
     std::string gitOutput;
     std::string gitCommitMessage;
+    std::unique_ptr<CodexManager> codexManager;
+    std::future<CodexRunResult> codexFuture;
+    bool codexRunInProgress = false;
+    std::string codexPrompt;
+    std::string codexOutput;
+    std::string codexModel;
+    std::string codexLastCommand;
+    std::string codexStatusMessage = "Idle";
+    bool codexEphemeral = false;
+    bool codexUseFullAuto = true;
+    int codexSandboxMode = 1;
+    std::vector<std::string> codexTaskFiles;
+    int codexSelectedTaskFile = 0;
     
     void refreshDirectoryContents();
     void navigateToDirectory(const std::string& path);
@@ -104,7 +120,9 @@ private:
     void renderProjectSettings();
     void renderDirectoryBrowser();
     void renderGitWindow();
+    void renderCodexWindow();
     void refreshBrowserDirectories();
+    void refreshCodexTaskFiles();
     void addFileToProject(const std::string& filepath);
     void removeFileFromProject(const std::string& filepath);
     void renderProjectTree(std::shared_ptr<ProjectFolder> folder);
@@ -137,6 +155,7 @@ private:
     void handleBuildMenu();
     void handleViewMenu();
     void handleGitMenu();
+    void handleCodexMenu();
     void handleHelpMenu();
     
     // UI State
