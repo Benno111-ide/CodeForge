@@ -8,8 +8,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
-set(CMAKE_C_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
+if(MSVC)
+    add_compile_options("$<$<CONFIG:Debug>:/Zi>" "$<$<CONFIG:Debug>:/W4>")
+else()
+    add_compile_options("$<$<CONFIG:Debug>:-g>" "$<$<CONFIG:Debug>:-O0>" "$<$<CONFIG:Debug>:-Wall>" "$<$<CONFIG:Debug>:-Wextra>")
+endif()
 
 # Include FetchContent module for downloading dependencies
 include(FetchContent)
