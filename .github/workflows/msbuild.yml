@@ -20,7 +20,7 @@ jobs:
             executable: CodeForge
             executable_path: build/bin/CodeForge
             archive: codeforge-linux-build-${{ github.run_number }}.tar.gz
-          - os: windows-latest
+          - os: windows-2022
             label: windows
             executable: CodeForge.exe
             executable_path: build/bin/Release/CodeForge.exe
